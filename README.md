@@ -1,8 +1,9 @@
 # Qwen3.6-19B-A3B DeepSpeed SFT 交付说明
 
-本文档面向收到代码目录和 Docker 镜像文件的使用者。按第 3、4、6 节操作，
-即可启动训练并在每个已保存 checkpoint 上异步计算验证集 pass rate，无需在
-宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn 或 vLLM。
+本文档面向收到代码目录，并能访问 Docker Hub 镜像或离线镜像文件的使用者。
+按第 3、4、6 节操作，即可启动训练并在每个已保存 checkpoint 上异步计算
+验证集 pass rate，无需在宿主机单独安装 PyTorch、Transformers、DeepSpeed、
+flash-attn 或 vLLM。
 
 > 安全提示：下文的 `hf-xxxxxxx` 是交付方提供的 Hugging Face 访问令牌。
 > 不要把真实令牌写入代码、README、Shell 历史或 Git 仓库。若令牌已经公开，
@@ -192,22 +193,90 @@ math100w/
 如果仓库中的目录发生变化，只需同步修改启动命令中
 `/datasets/...` 后面的相对路径。
 
-## 4. 使用交付的 Docker 镜像文件
+## 4. 获取 Docker 镜像
 
-交付的文件名为：
+训练和异步验证分别使用以下两个镜像：
+
+```text
+iceswallow/qwen36-delivery:sft-1.0
+iceswallow/qwen36-delivery:vllm-eval-1.0
+```
+
+推荐从 Docker Hub 拉取。无法访问 Docker Hub 时，可以使用第 4.3 节的离线
+tar 文件。模型和数据不在镜像中，仍需按第 3 节单独下载。
+
+### 4.1 从 Docker Hub 拉取
+
+Docker Hub 仓库地址：
+
+<https://hub.docker.com/repository/docker/iceswallow/qwen36-delivery/general>
+
+如果仓库是 Private，接收方需要先把自己的 Docker Hub 账号提供给仓库管理员，
+由管理员授予访问权限。不要共享仓库所有者的密码或 Token。获得权限后，在训练
+服务器上使用接收方自己的账号登录：
+
+```bash
+docker login
+```
+
+也可以显式指定接收方自己的用户名：
+
+```bash
+docker login --username 接收方DockerHub用户名
+```
+
+在 Password 提示处输入接收方自己的 Docker Hub Personal Access Token，不要
+把 Token 写进命令、README 或脚本。
+
+拉取训练和验证镜像：
+
+```bash
+docker pull iceswallow/qwen36-delivery:sft-1.0
+docker pull iceswallow/qwen36-delivery:vllm-eval-1.0
+```
+
+第 6 节命令使用较短的本地镜像名，因此拉取后增加本地标签：
+
+```bash
+docker tag \
+  iceswallow/qwen36-delivery:sft-1.0 \
+  qwen36-sft:1.0
+
+docker tag \
+  iceswallow/qwen36-delivery:vllm-eval-1.0 \
+  qwen36-vllm-eval:1.0
+```
+
+### 4.2 检查镜像
+
+无论使用 Docker Hub 还是离线文件，都执行以下命令确认两个本地镜像存在：
+
+```bash
+docker image inspect qwen36-sft:1.0 >/dev/null
+docker image inspect qwen36-vllm-eval:1.0 >/dev/null
+docker images | grep -E 'qwen36-(sft|vllm-eval)'
+```
+
+检查容器能够访问 GPU：
+
+```bash
+docker run --rm --gpus all \
+  --entrypoint nvidia-smi \
+  qwen36-sft:1.0
+```
+
+完成以上检查后不需要重新执行 `docker build`。
+
+### 4.3 使用离线镜像文件
+
+无法访问 Docker Hub 时，交付方可以提供：
 
 ```text
 qwen36-sft-with-vllm-multinode-1.0.tar
 ```
 
-它是 `docker save` 生成的未压缩 Docker 镜像归档，包含：
-
-- `qwen36-sft:1.0`：训练镜像；
-- `qwen36-vllm-eval:1.0`：推荐验证流程使用的独立 vLLM 评测镜像。
-
-### 4.1 校验文件
-
-将终端切换到 tar 所在目录并执行：
+这是 `docker save` 生成的未压缩归档，包含训练镜像和 vLLM 验证镜像。将终端
+切换到 tar 所在目录，先校验：
 
 ```bash
 sha256sum qwen36-sft-with-vllm-multinode-1.0.tar
@@ -219,24 +288,13 @@ sha256sum qwen36-sft-with-vllm-multinode-1.0.tar
 64383790cdf82f5b64f92ac21a73ae3a7b9e277980158df105995194cf8ee51f
 ```
 
-若校验值不同，说明文件在传输过程中损坏，不要继续导入。
-
-### 4.2 导入镜像
+若校验值不同，说明文件在传输过程中损坏，不要继续导入。校验一致后执行：
 
 ```bash
 docker load -i qwen36-sft-with-vllm-multinode-1.0.tar
 ```
 
-不要使用普通 `tar -xf` 解压该文件。导入后确认两个镜像存在：
-
-```bash
-docker image inspect qwen36-sft:1.0 >/dev/null
-docker image inspect qwen36-vllm-eval:1.0 >/dev/null
-docker images | grep -E 'qwen36-(sft|vllm-eval)'
-```
-
-标准训练只使用 `qwen36-sft:1.0`。模型和数据不需要重新打进镜像，也不需要
-重新执行 `docker build`。
+不要使用普通 `tar -xf` 解压该文件。导入后按第 4.2 节检查镜像。
 
 ## 5. 训练脚本完整参数及其含义
 
@@ -514,8 +572,8 @@ nohup docker run --rm \
   --num-train-epochs 1 \
   --use-lora false \
   --freeze-vision-tower true \
-  --save-steps 10 \
-  --save-total-limit 10 \
+  --save-steps 100 \
+  --save-total-limit 50 \
   --save-only-model false \
   --async-eval-markers true \
   --report-to none \
@@ -620,19 +678,19 @@ nohup docker run --rm \
     /datasets/split/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
     /datasets/split/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
   --max-samples-per-file \
-    2000 2000 2000 2000 1400 600 \
+    -1 -1 -1 -1 -1 -1 \
   --last-assistant-only-per-file \
     false false false false false true \
   --enable-thinking-per-file \
     true true true true true true \
-  --max-seq-length 24000 \
+  --max-seq-length 32000 \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --num-train-epochs 1 \
   --use-lora false \
   --freeze-vision-tower true \
-  --save-steps 10 \
-  --save-total-limit 10 \
+  --save-steps 50 \
+  --save-total-limit 50 \
   --save-only-model false \
   --async-eval-markers true \
   --report-to none \
