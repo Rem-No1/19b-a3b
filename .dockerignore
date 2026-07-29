@@ -1,0 +1,17 @@
+*
+!Dockerfile
+!README.md
+!requirements.lock
+!train/
+!train/**
+!eval/
+!eval/**
+
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+logs/
+outputs/
+model/
+models/
+data/
