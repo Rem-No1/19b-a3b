@@ -1,9 +1,13 @@
 # Qwen3.6-19B-A3B DeepSpeed SFT 交付说明
 
-本文档面向收到代码目录，并能访问 Docker Hub 镜像或离线镜像文件的使用者。
-按第 3、4、6 节操作，即可启动训练并在每个已保存 checkpoint 上异步计算
-验证集 pass rate，无需在宿主机单独安装 PyTorch、Transformers、DeepSpeed、
-flash-attn 或 vLLM。
+本文档面向收到代码目录和 Docker 镜像文件的使用者。按第 3、4、6 节操作，
+即可启动训练并在每个已保存 checkpoint 上异步计算验证集 pass rate，无需在
+宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn 或 vLLM。
+
+> **v1.0.1 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
+> 非主 rank 长时间等待预处理可能触发 DDP/NCCL timeout 的问题。v1.0.1 源码
+> 继续使用原 `qwen36-sft:1.0` 镜像，但训练容器必须按第 4.3 节只读挂载新版
+> `train/` 目录；不挂载时仍会执行镜像内置的 v1.0.0 代码。
 
 > 安全提示：下文的 `hf-xxxxxxx` 是交付方提供的 Hugging Face 访问令牌。
 > 不要把真实令牌写入代码、README、Shell 历史或 Git 仓库。若令牌已经公开，
@@ -40,7 +44,8 @@ qwen36_sft/
 │   └── vllm_environment_manifest.json
 └── tests/
     ├── test_async_eval.py
-    └── test_multinode_launcher.py
+    ├── test_multinode_launcher.py
+    └── test_training_preprocessing.py
 ```
 
 各文件用途如下：
@@ -193,90 +198,22 @@ math100w/
 如果仓库中的目录发生变化，只需同步修改启动命令中
 `/datasets/...` 后面的相对路径。
 
-## 4. 获取 Docker 镜像
+## 4. 使用交付的 Docker 镜像文件
 
-训练和异步验证分别使用以下两个镜像：
-
-```text
-iceswallow/qwen36-delivery:sft-1.0
-iceswallow/qwen36-delivery:vllm-eval-1.0
-```
-
-推荐从 Docker Hub 拉取。无法访问 Docker Hub 时，可以使用第 4.3 节的离线
-tar 文件。模型和数据不在镜像中，仍需按第 3 节单独下载。
-
-### 4.1 从 Docker Hub 拉取
-
-Docker Hub 仓库地址：
-
-<https://hub.docker.com/repository/docker/iceswallow/qwen36-delivery/general>
-
-如果仓库是 Private，接收方需要先把自己的 Docker Hub 账号提供给仓库管理员，
-由管理员授予访问权限。不要共享仓库所有者的密码或 Token。获得权限后，在训练
-服务器上使用接收方自己的账号登录：
-
-```bash
-docker login
-```
-
-也可以显式指定接收方自己的用户名：
-
-```bash
-docker login --username 接收方DockerHub用户名
-```
-
-在 Password 提示处输入接收方自己的 Docker Hub Personal Access Token，不要
-把 Token 写进命令、README 或脚本。
-
-拉取训练和验证镜像：
-
-```bash
-docker pull iceswallow/qwen36-delivery:sft-1.0
-docker pull iceswallow/qwen36-delivery:vllm-eval-1.0
-```
-
-第 6 节命令使用较短的本地镜像名，因此拉取后增加本地标签：
-
-```bash
-docker tag \
-  iceswallow/qwen36-delivery:sft-1.0 \
-  qwen36-sft:1.0
-
-docker tag \
-  iceswallow/qwen36-delivery:vllm-eval-1.0 \
-  qwen36-vllm-eval:1.0
-```
-
-### 4.2 检查镜像
-
-无论使用 Docker Hub 还是离线文件，都执行以下命令确认两个本地镜像存在：
-
-```bash
-docker image inspect qwen36-sft:1.0 >/dev/null
-docker image inspect qwen36-vllm-eval:1.0 >/dev/null
-docker images | grep -E 'qwen36-(sft|vllm-eval)'
-```
-
-检查容器能够访问 GPU：
-
-```bash
-docker run --rm --gpus all \
-  --entrypoint nvidia-smi \
-  qwen36-sft:1.0
-```
-
-完成以上检查后不需要重新执行 `docker build`。
-
-### 4.3 使用离线镜像文件
-
-无法访问 Docker Hub 时，交付方可以提供：
+交付的文件名为：
 
 ```text
 qwen36-sft-with-vllm-multinode-1.0.tar
 ```
 
-这是 `docker save` 生成的未压缩归档，包含训练镜像和 vLLM 验证镜像。将终端
-切换到 tar 所在目录，先校验：
+它是 `docker save` 生成的未压缩 Docker 镜像归档，包含：
+
+- `qwen36-sft:1.0`：训练镜像；
+- `qwen36-vllm-eval:1.0`：推荐验证流程使用的独立 vLLM 评测镜像。
+
+### 4.1 校验文件
+
+将终端切换到 tar 所在目录并执行：
 
 ```bash
 sha256sum qwen36-sft-with-vllm-multinode-1.0.tar
@@ -288,20 +225,84 @@ sha256sum qwen36-sft-with-vllm-multinode-1.0.tar
 64383790cdf82f5b64f92ac21a73ae3a7b9e277980158df105995194cf8ee51f
 ```
 
-若校验值不同，说明文件在传输过程中损坏，不要继续导入。校验一致后执行：
+若校验值不同，说明文件在传输过程中损坏，不要继续导入。
+
+### 4.2 导入镜像
 
 ```bash
 docker load -i qwen36-sft-with-vllm-multinode-1.0.tar
 ```
 
-不要使用普通 `tar -xf` 解压该文件。导入后按第 4.2 节检查镜像。
+不要使用普通 `tar -xf` 解压该文件。导入后确认两个镜像存在：
+
+```bash
+docker image inspect qwen36-sft:1.0 >/dev/null
+docker image inspect qwen36-vllm-eval:1.0 >/dev/null
+docker images | grep -E 'qwen36-(sft|vllm-eval)'
+```
+
+标准训练只使用 `qwen36-sft:1.0`。模型和数据不需要重新打进镜像，也不需要
+重新执行 `docker build`。
+
+### 4.3 获取 v1.0.1 热修复代码
+
+首次获取源码：
+
+```bash
+git clone https://github.com/Rem-No1/19b-a3b.git
+cd 19b-a3b
+git checkout v1.0.1
+```
+
+已有仓库时：
+
+```bash
+git fetch origin --tags
+git checkout v1.0.1
+```
+
+原镜像不包含热修复代码。运行训练容器时必须把仓库中的 `train/` 只读挂载到
+`/app/train`：
+
+```bash
+CODE_DIR=/absolute/path/to/19b-a3b
+
+docker run --rm \
+  -v "${CODE_DIR}/train:/app/train:ro" \
+  qwen36-sft:1.0 --help
+```
+
+无需重新下载镜像；volume mount 会在运行时覆盖镜像内置的旧 `train/` 目录。
+模型、数据、输出和 cache 的挂载方式不变。多机训练时所有节点必须 checkout
+同一个 Git tag，并挂载完全相同的代码。
+
+使用交付镜像运行热修复回归测试：
+
+```bash
+CODE_DIR=/absolute/path/to/19b-a3b
+
+docker run --rm \
+  -v "${CODE_DIR}:/workspace:ro" \
+  --entrypoint python \
+  qwen36-sft:1.0 \
+  -m unittest discover \
+  -s /workspace/tests \
+  -p test_training_preprocessing.py \
+  -v
+```
+
+预期最后输出 `Ran 4 tests` 和 `OK`。
 
 ## 5. 训练脚本完整参数及其含义
 
-查看镜像内置的实时帮助：
+查看 v1.0.1 训练代码的实时帮助：
 
 ```bash
-docker run --rm qwen36-sft:1.0 --help
+CODE_DIR=/absolute/path/to/19b-a3b
+
+docker run --rm \
+  -v "${CODE_DIR}/train:/app/train:ro" \
+  qwen36-sft:1.0 --help
 ```
 
 所有布尔参数均接受 `true/false`、`1/0`、`yes/no`、`on/off`。下表的默认值
@@ -344,6 +345,12 @@ docker run --rm qwen36-sft:1.0 --help
 若数据行自身包含 `enable_thinking` 或 `last_assistant_only`，行级设置的优先级
 高于逐文件参数；逐文件参数又高于全局参数。
 
+v1.0.1 在生成 sampling manifest 时只批量读取
+`source_file_index`、`last_assistant_only`、`n_tokens` 和 `has_loss`
+四个元数据字段，不再为统计操作反序列化大体积的 `input_ids` 和 `labels`。
+这不会删除或修改训练 Dataset 中的 token 和 label；Trainer 仍使用完整数据。
+Filtering 同样只读取 `has_loss` 和 `n_tokens` 来计算保留索引。
+
 ### 5.3 batch、优化器和训练步数
 
 | 参数 | 默认值 | 含义 |
@@ -359,6 +366,7 @@ docker run --rm qwen36-sft:1.0 --help
 | `--lr-scheduler-type` | `constant_with_warmup` | Transformers 学习率 scheduler 名称。 |
 | `--optim` | `adamw_torch` | Transformers optimizer 名称。DeepSpeed JSON 中的 AdamW 参数使用 `auto` 与 Trainer 同步。 |
 | `--logging-steps` | `1` | 每多少个 global steps 输出一次训练日志。 |
+| `--ddp-timeout` | `86400` | 分布式操作最长等待秒数；百万级数据预处理期间非主 rank 会等待主 rank，默认允许等待 24 小时。 |
 | `--gradient-checkpointing` | `true` | 用额外计算换取更低的 activation 显存。 |
 | `--freeze-vision-tower` | `true` | 冻结文本 SFT 不使用的视觉塔参数。 |
 
@@ -474,7 +482,8 @@ checkpoint 后启动 vLLM、并发生成 HARP 答案、计算 pass rate、保存
 
 ## 6. 训练脚本启动代码
 
-以下示例均使用六个训练文件、24k 上下文、每卡 batch size 1、梯度累积 8、
+单机示例使用六个完整训练文件和 32k 上下文；多机首次联调示例从六个文件合计
+抽取 10,000 条并使用 24k 上下文。两者均为每卡 batch size 1、梯度累积 8、
 全参数训练、每 10 个 global steps 保存 checkpoint、最多保留 10 个 checkpoint，
 并训练 1 个 epoch。每个 checkpoint 会使用
 `/datasets/val/HARP/HARP_difficulty_2_sample_50.jsonl` 异步计算一次 pass
@@ -482,6 +491,9 @@ rate；验证不会阻塞训练。
 
 Docker 的 `--gpus all` 只负责把宿主机 GPU 暴露给容器，真正参与训练的卡由
 镜像后的脚本参数 `--gpus` 决定。
+
+以下训练示例都假定已按第 4.3 节获取 v1.0.1 源码，并通过
+`-v "${CODE_DIR}/train:/app/train:ro"` 覆盖镜像内置训练代码。
 
 ### 6.1 单机多卡
 
@@ -494,6 +506,7 @@ checkpoint。
 
 ```bash
 DELIVERY_ROOT=/data/qwen36-delivery
+CODE_DIR=/absolute/path/to/19b-a3b
 MODEL_DIR="${DELIVERY_ROOT}/model/19b-a3b"
 DATA_DIR="${DELIVERY_ROOT}/data/math100w"
 OUTPUT_ROOT="${DELIVERY_ROOT}/output"
@@ -505,6 +518,8 @@ mkdir -p \
   "${LOG_DIR}" \
   "${CACHE_DIR}/torch" \
   "${CACHE_DIR}/vllm"
+
+test -f "${CODE_DIR}/train/train_qwen36_19b_a3b_sft_deepspeed.py"
 
 RUN_NAME="qwen36-19b-a3b-sft-$(date +%Y%m%d_%H%M%S)"
 TRAIN_CONTAINER="${RUN_NAME}-train"
@@ -544,6 +559,7 @@ nohup docker run --rm \
   --ipc=host \
   --shm-size=64g \
   --ulimit memlock=-1 \
+  -v "${CODE_DIR}/train:/app/train:ro" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${DATA_DIR}:/datasets:ro" \
   -v "${OUTPUT_ROOT}:/output" \
@@ -572,11 +588,13 @@ nohup docker run --rm \
   --num-train-epochs 1 \
   --use-lora false \
   --freeze-vision-tower true \
-  --save-steps 100 \
-  --save-total-limit 50 \
+  --save-steps 10 \
+  --save-total-limit 10 \
   --save-only-model false \
   --async-eval-markers true \
   --report-to none \
+  --dataset-num-proc 16 \
+  --ddp-timeout 86400 \
   >"${TRAIN_LOG_FILE}" 2>&1 &
 
 TRAIN_PID=$!
@@ -596,6 +614,7 @@ echo "验证汇总=${OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl"
 下面以两台服务器、每台 8 张 GPU 为例。两台服务器必须满足：
 
 - 已导入完全相同的 `qwen36-sft:1.0` 镜像；
+- 已 checkout 完全相同的 v1.0.1 Git tag，并挂载相同的 `train/` 代码；
 - 模型和数据内容完全相同，可以是每台本地副本，也可以是共享只读目录；
 - node 0 的 `MASTER_ADDR:MASTER_PORT` 能被其他节点访问；
 - 节点之间允许 PyTorch/NCCL 通信，Docker 使用 `--network host`；
@@ -628,6 +647,7 @@ RUN_NAME=qwen36-19b-a3b-sft-multinode-001
 
 ```bash
 DELIVERY_ROOT=/data/qwen36-delivery
+CODE_DIR=/absolute/path/to/19b-a3b
 MODEL_DIR="${DELIVERY_ROOT}/model/19b-a3b"
 DATA_DIR="${DELIVERY_ROOT}/data/math100w"
 LOCAL_LOG_DIR="${DELIVERY_ROOT}/logs"
@@ -645,6 +665,7 @@ RUN_NAME=qwen36-19b-a3b-sft-multinode-001
 
 mkdir -p "${LOCAL_LOG_DIR}" "${LOCAL_CACHE_DIR}"
 test -d "${SHARED_OUTPUT_ROOT}"
+test -f "${CODE_DIR}/train/train_qwen36_19b_a3b_sft_deepspeed.py"
 
 CONTAINER_NAME="${RUN_NAME}-node${NODE_RANK}"
 LOG_FILE="${LOCAL_LOG_DIR}/${CONTAINER_NAME}.log"
@@ -656,6 +677,7 @@ nohup docker run --rm \
   --ipc=host \
   --shm-size=64g \
   --ulimit memlock=-1 \
+  -v "${CODE_DIR}/train:/app/train:ro" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${DATA_DIR}:/datasets:ro" \
   -v "${SHARED_OUTPUT_ROOT}:/output" \
@@ -678,22 +700,24 @@ nohup docker run --rm \
     /datasets/split/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
     /datasets/split/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
   --max-samples-per-file \
-    -1 -1 -1 -1 -1 -1 \
+    2000 2000 2000 2000 1400 600 \
   --last-assistant-only-per-file \
     false false false false false true \
   --enable-thinking-per-file \
     true true true true true true \
-  --max-seq-length 32000 \
+  --max-seq-length 24000 \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --num-train-epochs 1 \
   --use-lora false \
   --freeze-vision-tower true \
-  --save-steps 50 \
-  --save-total-limit 50 \
+  --save-steps 10 \
+  --save-total-limit 10 \
   --save-only-model false \
   --async-eval-markers true \
   --report-to none \
+  --dataset-num-proc 16 \
+  --ddp-timeout 86400 \
   >"${LOG_FILE}" 2>&1 &
 
 TRAIN_PID=$!

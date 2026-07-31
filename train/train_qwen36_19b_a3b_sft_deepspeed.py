@@ -44,6 +44,14 @@ DEFAULT_TARGET_MODULES = [
 ]
 EXPECTED_ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
 IGNORE_INDEX = -100
+DEFAULT_DDP_TIMEOUT_SECONDS = 86400
+MANIFEST_BATCH_SIZE = 10000
+MANIFEST_COLUMNS = (
+    "source_file_index",
+    "last_assistant_only",
+    "n_tokens",
+    "has_loss",
+)
 
 
 def parse_bool(value):
@@ -88,6 +96,15 @@ def build_arg_parser():
         default=None,
     )
     parser.add_argument("--dataset-num-proc", type=int, default=8)
+    parser.add_argument(
+        "--ddp-timeout",
+        type=int,
+        default=DEFAULT_DDP_TIMEOUT_SECONDS,
+        help=(
+            "Distributed operation timeout in seconds. Large dataset preprocessing "
+            "runs under main_process_first, so non-main ranks may wait for hours."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--attn-implementation", default="flash_attention_2")
 
@@ -205,6 +222,8 @@ def rank0_print(*args, **kwargs):
 
 
 def normalize_args(args):
+    if args.ddp_timeout <= 0:
+        raise ValueError("--ddp-timeout 必须大于 0")
     if args.max_samples is not None and args.max_samples <= 0:
         args.max_samples = None
     if args.max_eval_samples is not None and args.max_eval_samples <= 0:
@@ -531,21 +550,26 @@ def build_sampling_manifest(args, options, sampling_results, tokenized_rows):
                 "dropped_no_assistant_loss": 0,
             }
         )
-    for row in tokenized_rows:
-        entry = files[row["source_file_index"]]
-        mode = (
-            "last_assistant_only"
-            if row["last_assistant_only"]
-            else "all_assistant_turns"
-        )
-        entry[f"selected_{mode}"] += 1
-        if row["n_tokens"] > args.max_seq_length:
-            entry["dropped_too_long"] += 1
-        elif not row["has_loss"]:
-            entry["dropped_no_assistant_loss"] += 1
-        else:
-            entry["kept_count"] += 1
-            entry[f"kept_{mode}"] += 1
+    manifest_rows = tokenized_rows.select_columns(list(MANIFEST_COLUMNS))
+    for start in range(0, len(manifest_rows), MANIFEST_BATCH_SIZE):
+        batch = manifest_rows[start : start + MANIFEST_BATCH_SIZE]
+        for file_index, last_only, n_tokens, has_loss in zip(
+            batch["source_file_index"],
+            batch["last_assistant_only"],
+            batch["n_tokens"],
+            batch["has_loss"],
+            strict=True,
+        ):
+            entry = files[file_index]
+            mode = "last_assistant_only" if last_only else "all_assistant_turns"
+            entry[f"selected_{mode}"] += 1
+            if n_tokens > args.max_seq_length:
+                entry["dropped_too_long"] += 1
+            elif not has_loss:
+                entry["dropped_no_assistant_loss"] += 1
+            else:
+                entry["kept_count"] += 1
+                entry[f"kept_{mode}"] += 1
     return {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -554,6 +578,16 @@ def build_sampling_manifest(args, options, sampling_results, tokenized_rows):
         "global_max_samples": options["max_samples"],
         "files": files,
     }
+
+
+def filter_trainable_rows(tokenized_rows, max_seq_length, dataset_num_proc, split):
+    filter_num_proc = dataset_num_proc if dataset_num_proc > 1 else None
+    return tokenized_rows.filter(
+        lambda has_loss, n_tokens: has_loss and n_tokens <= max_seq_length,
+        input_columns=["has_loss", "n_tokens"],
+        num_proc=filter_num_proc,
+        desc=f"Filtering long/empty {split} examples",
+    )
 
 
 @dataclass
@@ -628,12 +662,14 @@ def build_dataset(args, tokenizer, split="train"):
         num_proc=max(args.dataset_num_proc, 1),
         desc=f"Tokenizing {split} tool-chat data",
     )
+    rank0_print(f"Building {split} sampling manifest from metadata columns...")
     manifest = build_sampling_manifest(args, options, sampling_results, tokenized)
     total = len(tokenized)
-    kept = tokenized.filter(
-        lambda row: row["has_loss"] and row["n_tokens"] <= args.max_seq_length,
-        num_proc=max(args.dataset_num_proc, 1),
-        desc=f"Filtering long/empty {split} examples",
+    kept = filter_trainable_rows(
+        tokenized,
+        args.max_seq_length,
+        args.dataset_num_proc,
+        split,
     )
     thinking = sum(bool(value) for value in kept["trains_thinking"])
     last_assistant_only = sum(bool(value) for value in kept["last_assistant_only"])
@@ -689,6 +725,7 @@ def build_training_arguments(args):
         save_only_model=args.save_only_model,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": True},
+        ddp_timeout=args.ddp_timeout,
         report_to=args.report_to,
         run_name=args.run_name,
         seed=args.seed,
