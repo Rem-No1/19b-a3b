@@ -5,9 +5,10 @@
 宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn 或 vLLM。
 
 > **v1.0.1 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
-> 非主 rank 长时间等待预处理可能触发 DDP/NCCL timeout 的问题。v1.0.1 源码
-> 继续使用原 `qwen36-sft:1.0` 镜像，但训练容器必须按第 4.3 节只读挂载新版
-> `train/` 目录；不挂载时仍会执行镜像内置的 v1.0.0 代码。
+> 非主 rank 长时间等待预处理可能触发 DDP/NCCL timeout 的问题；全参训练默认
+> 学习率改为从 `5e-5` 余弦衰减到 `5e-6`。v1.0.1 源码继续使用原
+> `qwen36-sft:1.0` 镜像，但训练容器必须按第 4.3 节只读挂载新版 `train/`
+> 目录；不挂载时仍会执行镜像内置的 v1.0.0 代码。
 
 > 安全提示：下文的 `hf-xxxxxxx` 是交付方提供的 Hugging Face 访问令牌。
 > 不要把真实令牌写入代码、README、Shell 历史或 Git 仓库。若令牌已经公开，
@@ -291,7 +292,7 @@ docker run --rm \
   -v
 ```
 
-预期最后输出 `Ran 4 tests` 和 `OK`。
+预期最后输出 `Ran 9 tests` 和 `OK`。
 
 ## 5. 训练脚本完整参数及其含义
 
@@ -360,15 +361,21 @@ Filtering 同样只读取 `has_loss` 和 `n_tokens` 来计算保留索引。
 | `--gradient-accumulation-steps` | `8` | 累积多少个 micro step 后进行一次 optimizer/global step。 |
 | `--num-train-epochs` | `1.0` | 训练 epoch 数；当 `--max-steps > 0` 时由后者控制停止。 |
 | `--max-steps` | `-1` | 最大 optimizer/global steps；`-1` 表示按 epoch 训练。 |
-| `--learning-rate` | 全参 `5e-6`；LoRA `2e-4` | 初始/最大学习率；显式传入时覆盖自动默认值。 |
+| `--learning-rate` | 全参 `5e-5`；LoRA `2e-4` | 无 warmup 时为初始/最大学习率；显式传入时覆盖自动默认值。 |
+| `--min-learning-rate` | 全参 `5e-6`；LoRA 不设置 | `cosine_with_min_lr` 调度器的最终最低学习率，不能超过 `--learning-rate`。 |
 | `--warmup-ratio` | `0.0` | 总训练步数中用于 warmup 的比例。 |
 | `--weight-decay` | `0.0` | AdamW weight decay。 |
-| `--lr-scheduler-type` | `constant_with_warmup` | Transformers 学习率 scheduler 名称。 |
+| `--lr-scheduler-type` | 全参 `cosine_with_min_lr`；LoRA `constant_with_warmup` | Transformers 学习率 scheduler。全参默认从 `5e-5` 余弦衰减到 `5e-6`。 |
 | `--optim` | `adamw_torch` | Transformers optimizer 名称。DeepSpeed JSON 中的 AdamW 参数使用 `auto` 与 Trainer 同步。 |
 | `--logging-steps` | `1` | 每多少个 global steps 输出一次训练日志。 |
 | `--ddp-timeout` | `86400` | 分布式操作最长等待秒数；百万级数据预处理期间非主 rank 会等待主 rank，默认允许等待 24 小时。 |
 | `--gradient-checkpointing` | `true` | 用额外计算换取更低的 activation 显存。 |
 | `--freeze-vision-tower` | `true` | 冻结文本 SFT 不使用的视觉塔参数。 |
+
+内置 DeepSpeed JSON 有意不定义 `scheduler`：学习率调度完全交给
+Transformers Trainer，避免 DeepSpeed 的 `WarmupLR` 覆盖
+`cosine_with_min_lr`。如果自行替换 DeepSpeed 配置，也应保持不设置
+`scheduler`，否则上述余弦衰减参数不会生效。
 
 有效全局 batch size 的计算公式是：
 
@@ -381,6 +388,11 @@ Filtering 同样只读取 `has_loss` 和 `n_tokens` 来计算保留索引。
 `1 × 5 × 1 × 8 = 40`；两台机器各 8 卡且其他参数不变时为
 `2 × 8 × 1 × 8 = 128`。增加节点数会改变优化语义，应重新评估学习率、
 训练步数和梯度累积。
+
+全参训练默认 `warmup_ratio=0`，因此第一个 optimizer step 使用接近 `5e-5`
+的学习率，随后按半个余弦周期平滑衰减，并在训练最后一步达到 `5e-6`。如果显式
+设置 `--warmup-ratio > 0`，则学习率会先从接近 0 升至 `5e-5`，再开始余弦
+衰减；此时 `5e-5` 是 warmup 后的峰值，而不是第一个 step 的学习率。
 
 ### 5.4 保存、训练进程内验证和异步验证参数
 
@@ -586,6 +598,9 @@ nohup docker run --rm \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --num-train-epochs 1 \
+  --learning-rate 5e-5 \
+  --min-learning-rate 5e-6 \
+  --lr-scheduler-type cosine_with_min_lr \
   --use-lora false \
   --freeze-vision-tower true \
   --save-steps 10 \
@@ -709,6 +724,9 @@ nohup docker run --rm \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --num-train-epochs 1 \
+  --learning-rate 5e-5 \
+  --min-learning-rate 5e-6 \
+  --lr-scheduler-type cosine_with_min_lr \
   --use-lora false \
   --freeze-vision-tower true \
   --save-steps 10 \

@@ -45,6 +45,9 @@ DEFAULT_TARGET_MODULES = [
 EXPECTED_ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
 IGNORE_INDEX = -100
 DEFAULT_DDP_TIMEOUT_SECONDS = 86400
+DEFAULT_FULL_LEARNING_RATE = 5e-5
+DEFAULT_FULL_MIN_LEARNING_RATE = 5e-6
+DEFAULT_LORA_LEARNING_RATE = 2e-4
 MANIFEST_BATCH_SIZE = 10000
 MANIFEST_COLUMNS = (
     "source_file_index",
@@ -114,9 +117,10 @@ def build_arg_parser():
     parser.add_argument("--num-train-epochs", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--min-learning-rate", type=float, default=None)
     parser.add_argument("--warmup-ratio", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--lr-scheduler-type", default="constant_with_warmup")
+    parser.add_argument("--lr-scheduler-type", default=None)
     parser.add_argument("--optim", default="adamw_torch")
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument(
@@ -229,7 +233,29 @@ def normalize_args(args):
     if args.max_eval_samples is not None and args.max_eval_samples <= 0:
         args.max_eval_samples = None
     if args.learning_rate is None:
-        args.learning_rate = 2e-4 if args.use_lora else 5e-6
+        args.learning_rate = (
+            DEFAULT_LORA_LEARNING_RATE
+            if args.use_lora
+            else DEFAULT_FULL_LEARNING_RATE
+        )
+    if args.learning_rate <= 0:
+        raise ValueError("--learning-rate 必须大于 0")
+    if args.lr_scheduler_type is None:
+        args.lr_scheduler_type = (
+            "constant_with_warmup" if args.use_lora else "cosine_with_min_lr"
+        )
+    if args.lr_scheduler_type == "cosine_with_min_lr":
+        if args.min_learning_rate is None:
+            args.min_learning_rate = DEFAULT_FULL_MIN_LEARNING_RATE
+        if not 0 <= args.min_learning_rate <= args.learning_rate:
+            raise ValueError(
+                "--min-learning-rate 必须大于等于 0，且不能超过 --learning-rate"
+            )
+    elif args.min_learning_rate is not None:
+        raise ValueError(
+            "--min-learning-rate 仅支持与 "
+            "--lr-scheduler-type cosine_with_min_lr 一起使用"
+        )
     return args
 
 
@@ -701,6 +727,10 @@ def build_dataset(args, tokenizer, split="train"):
 def build_training_arguments(args):
     from transformers import TrainingArguments
 
+    lr_scheduler_kwargs = None
+    if args.lr_scheduler_type == "cosine_with_min_lr":
+        lr_scheduler_kwargs = {"min_lr": args.min_learning_rate}
+
     return TrainingArguments(
         output_dir=args.output_dir,
         deepspeed=args.deepspeed,
@@ -713,6 +743,7 @@ def build_training_arguments(args):
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         lr_scheduler_type=args.lr_scheduler_type,
+        lr_scheduler_kwargs=lr_scheduler_kwargs,
         optim=args.optim,
         bf16=True,
         tf32=True,

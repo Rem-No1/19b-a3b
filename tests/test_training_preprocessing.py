@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -149,6 +150,89 @@ class TrainingPreprocessingTests(unittest.TestCase):
             training_args = training.build_training_arguments(args)
 
         self.assertEqual(training_args.kwargs["ddp_timeout"], 7200)
+
+    def test_full_parameter_defaults_use_cosine_learning_rate_floor(self):
+        args = training.normalize_args(
+            training.build_arg_parser().parse_args(
+                ["--data-files", "/data/train.jsonl"]
+            )
+        )
+
+        self.assertEqual(args.learning_rate, 5e-5)
+        self.assertEqual(args.lr_scheduler_type, "cosine_with_min_lr")
+        self.assertEqual(args.min_learning_rate, 5e-6)
+
+    def test_lora_defaults_keep_constant_scheduler(self):
+        args = training.normalize_args(
+            training.build_arg_parser().parse_args(
+                [
+                    "--data-files",
+                    "/data/train.jsonl",
+                    "--use-lora",
+                    "true",
+                ]
+            )
+        )
+
+        self.assertEqual(args.learning_rate, 2e-4)
+        self.assertEqual(args.lr_scheduler_type, "constant_with_warmup")
+        self.assertIsNone(args.min_learning_rate)
+
+    def test_min_learning_rate_cannot_exceed_peak(self):
+        args = training.build_arg_parser().parse_args(
+            [
+                "--data-files",
+                "/data/train.jsonl",
+                "--learning-rate",
+                "5e-6",
+                "--min-learning-rate",
+                "5e-5",
+                "--lr-scheduler-type",
+                "cosine_with_min_lr",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "不能超过 --learning-rate"):
+            training.normalize_args(args)
+
+    def test_cosine_scheduler_reaches_configured_floor(self):
+        try:
+            from transformers import get_scheduler
+        except ImportError:
+            self.skipTest("transformers is only installed in the delivery image")
+
+        parameter = training.torch.nn.Parameter(training.torch.tensor(1.0))
+        optimizer = training.torch.optim.SGD([parameter], lr=5e-5)
+        scheduler = get_scheduler(
+            "cosine_with_min_lr",
+            optimizer,
+            num_warmup_steps=0,
+            num_training_steps=10,
+            scheduler_specific_kwargs={"min_lr": 5e-6},
+        )
+
+        initial_learning_rate = optimizer.param_groups[0]["lr"]
+        for _ in range(10):
+            optimizer.step()
+            scheduler.step()
+
+        self.assertAlmostEqual(initial_learning_rate, 5e-5)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 5e-6)
+
+    def test_deepspeed_config_delegates_scheduler_to_trainer(self):
+        config_path = (
+            PACKAGE_ROOT
+            / "train"
+            / "ds_config"
+            / "qwen36_19b_a3b_zero3.json"
+        )
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn(
+            "scheduler",
+            config,
+            "DeepSpeed scheduler 会覆盖 TrainingArguments 中的余弦调度器",
+        )
 
     def test_ddp_timeout_must_be_positive(self):
         args = training.build_arg_parser().parse_args(
