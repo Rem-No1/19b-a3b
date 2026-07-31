@@ -593,7 +593,7 @@ nohup docker run --rm \
   --save-only-model false \
   --async-eval-markers true \
   --report-to none \
-  --dataset-num-proc 16 \
+  --dataset-num-proc 64 \
   --ddp-timeout 86400 \
   >"${TRAIN_LOG_FILE}" 2>&1 &
 
@@ -700,12 +700,12 @@ nohup docker run --rm \
     /datasets/split/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
     /datasets/split/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
   --max-samples-per-file \
-    2000 2000 2000 2000 1400 600 \
+    -1 -1 -1 -1 -1 -1 \
   --last-assistant-only-per-file \
     false false false false false true \
   --enable-thinking-per-file \
     true true true true true true \
-  --max-seq-length 24000 \
+  --max-seq-length 32000 \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --num-train-epochs 1 \
@@ -716,7 +716,7 @@ nohup docker run --rm \
   --save-only-model false \
   --async-eval-markers true \
   --report-to none \
-  --dataset-num-proc 16 \
+  --dataset-num-proc 64 \
   --ddp-timeout 86400 \
   >"${LOG_FILE}" 2>&1 &
 
