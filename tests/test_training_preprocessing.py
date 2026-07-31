@@ -234,6 +234,48 @@ class TrainingPreprocessingTests(unittest.TestCase):
             "DeepSpeed scheduler 会覆盖 TrainingArguments 中的余弦调度器",
         )
 
+    def test_offload_is_enabled_by_default(self):
+        args = training.normalize_args(
+            training.build_arg_parser().parse_args(
+                ["--data-files", "/data/train.jsonl"]
+            )
+        )
+        config = training.build_deepspeed_config(args)
+        zero_config = config["zero_optimization"]
+
+        self.assertTrue(args.offload)
+        self.assertEqual(zero_config["offload_param"]["device"], "cpu")
+        self.assertEqual(zero_config["offload_optimizer"]["device"], "cpu")
+
+    def test_offload_can_be_disabled_without_changing_source_config(self):
+        args = training.normalize_args(
+            training.build_arg_parser().parse_args(
+                [
+                    "--data-files",
+                    "/data/train.jsonl",
+                    "--offload",
+                    "false",
+                ]
+            )
+        )
+        config = training.build_deepspeed_config(args)
+        zero_config = config["zero_optimization"]
+        source_config = json.loads(
+            Path(args.deepspeed).read_text(encoding="utf-8")
+        )
+
+        self.assertFalse(args.offload)
+        self.assertNotIn("offload_param", zero_config)
+        self.assertNotIn("offload_optimizer", zero_config)
+        self.assertIn(
+            "offload_param",
+            source_config["zero_optimization"],
+        )
+        self.assertIn(
+            "offload_optimizer",
+            source_config["zero_optimization"],
+        )
+
     def test_ddp_timeout_must_be_positive(self):
         args = training.build_arg_parser().parse_args(
             ["--data-files", "/data/train.jsonl", "--ddp-timeout", "0"]

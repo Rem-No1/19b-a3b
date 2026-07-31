@@ -82,6 +82,15 @@ def build_arg_parser():
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--deepspeed", default=str(DEFAULT_DEEPSPEED))
+    parser.add_argument(
+        "--offload",
+        type=parse_bool,
+        default=True,
+        help=(
+            "Whether to offload both ZeRO-3 parameters and optimizer states to CPU. "
+            "Set false only when aggregate GPU memory is sufficient."
+        ),
+    )
     parser.add_argument("--expected-num-experts", type=int, default=128)
     parser.add_argument("--max-seq-length", type=int, default=16000)
     parser.add_argument("--max-samples", type=int, default=-1)
@@ -733,7 +742,7 @@ def build_training_arguments(args):
 
     return TrainingArguments(
         output_dir=args.output_dir,
-        deepspeed=args.deepspeed,
+        deepspeed=build_deepspeed_config(args),
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -764,6 +773,28 @@ def build_training_arguments(args):
         dataloader_num_workers=4,
         remove_unused_columns=False,
     )
+
+
+def build_deepspeed_config(args):
+    config = json.loads(Path(args.deepspeed).read_text(encoding="utf-8"))
+    zero_config = config.get("zero_optimization")
+    if not isinstance(zero_config, dict):
+        raise ValueError(
+            f"DeepSpeed 配置缺少 zero_optimization 对象: {args.deepspeed}"
+        )
+    if args.offload:
+        zero_config["offload_optimizer"] = {
+            "device": "cpu",
+            "pin_memory": True,
+        }
+        zero_config["offload_param"] = {
+            "device": "cpu",
+            "pin_memory": True,
+        }
+    else:
+        zero_config.pop("offload_optimizer", None)
+        zero_config.pop("offload_param", None)
+    return config
 
 
 def build_model_and_tokenizer(args):
@@ -833,6 +864,10 @@ def train(args):
     args = normalize_args(args)
     runtime_preflight(args)
     training_args = build_training_arguments(args)
+    rank0_print(
+        "DeepSpeed ZeRO-3 CPU parameter/optimizer offload="
+        f"{'启用' if args.offload else '关闭'}"
+    )
     model, tokenizer = build_model_and_tokenizer(args)
     model = apply_lora_if_requested(args, model)
 

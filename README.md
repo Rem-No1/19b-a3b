@@ -4,9 +4,10 @@
 即可启动训练并在每个已保存 checkpoint 上异步计算验证集 pass rate，无需在
 宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn 或 vLLM。
 
-> **v1.0.1 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
+> **v1.0.2 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
 > 非主 rank 长时间等待预处理可能触发 DDP/NCCL timeout 的问题；全参训练默认
-> 学习率改为从 `5e-5` 余弦衰减到 `5e-6`。v1.0.1 源码继续使用原
+> 学习率改为从 `5e-5` 余弦衰减到 `5e-6`，并支持通过 `--offload`
+> 开关选择是否使用 CPU offload。v1.0.2 源码继续使用原
 > `qwen36-sft:1.0` 镜像，但训练容器必须按第 4.3 节只读挂载新版 `train/`
 > 目录；不挂载时仍会执行镜像内置的 v1.0.0 代码。
 
@@ -245,21 +246,21 @@ docker images | grep -E 'qwen36-(sft|vllm-eval)'
 标准训练只使用 `qwen36-sft:1.0`。模型和数据不需要重新打进镜像，也不需要
 重新执行 `docker build`。
 
-### 4.3 获取 v1.0.1 热修复代码
+### 4.3 获取 v1.0.2 热修复代码
 
 首次获取源码：
 
 ```bash
 git clone https://github.com/Rem-No1/19b-a3b.git
 cd 19b-a3b
-git checkout v1.0.1
+git checkout v1.0.2
 ```
 
 已有仓库时：
 
 ```bash
 git fetch origin --tags
-git checkout v1.0.1
+git checkout v1.0.2
 ```
 
 原镜像不包含热修复代码。运行训练容器时必须把仓库中的 `train/` 只读挂载到
@@ -292,11 +293,11 @@ docker run --rm \
   -v
 ```
 
-预期最后输出 `Ran 9 tests` 和 `OK`。
+预期最后输出 `Ran 11 tests` 和 `OK`。
 
 ## 5. 训练脚本完整参数及其含义
 
-查看 v1.0.1 训练代码的实时帮助：
+查看 v1.0.2 训练代码的实时帮助：
 
 ```bash
 CODE_DIR=/absolute/path/to/19b-a3b
@@ -319,6 +320,7 @@ docker run --rm \
 | `--eval-data-files` | 不启用 | 可选验证文件；提供后按 `--eval-steps` 在训练进程内验证。 |
 | `--output-dir` | `/output/${RUN_NAME}` | checkpoint、Trainer 状态和数据清单输出目录。 |
 | `--deepspeed` | 内置 ZeRO-3 JSON | DeepSpeed 配置文件路径。 |
+| `--offload` | `true` | 是否把 ZeRO-3 参数和 optimizer state 同时 offload 到 CPU；设为 `false` 时两者都保留在 GPU。 |
 | `--expected-num-experts` | `128` | 预检时要求模型具有的 routed expert 数量。 |
 | `--resume-from-checkpoint` | 不启用 | 从指定 `checkpoint-N` 恢复模型、优化器、scheduler 和训练进度。 |
 | `--run-name` | 启动器自动生成 | 本次任务名称；同时用于默认输出子目录。 |
@@ -346,7 +348,7 @@ docker run --rm \
 若数据行自身包含 `enable_thinking` 或 `last_assistant_only`，行级设置的优先级
 高于逐文件参数；逐文件参数又高于全局参数。
 
-v1.0.1 在生成 sampling manifest 时只批量读取
+v1.0.2 在生成 sampling manifest 时只批量读取
 `source_file_index`、`last_assistant_only`、`n_tokens` 和 `has_loss`
 四个元数据字段，不再为统计操作反序列化大体积的 `input_ids` 和 `labels`。
 这不会删除或修改训练 Dataset 中的 token 和 label；Trainer 仍使用完整数据。
@@ -376,6 +378,11 @@ Filtering 同样只读取 `has_loss` 和 `n_tokens` 来计算保留索引。
 Transformers Trainer，避免 DeepSpeed 的 `WarmupLR` 覆盖
 `cosine_with_min_lr`。如果自行替换 DeepSpeed 配置，也应保持不设置
 `scheduler`，否则上述余弦衰减参数不会生效。
+
+`--offload true` 是默认且更稳妥的配置，显著降低 GPU 显存需求，但 CPU-GPU
+数据交换可能降低训练速度。如果每张 GPU 都有足够显存，可传
+`--offload false`，继续使用 ZeRO-3 分片，但参数与 optimizer state 不再
+放到 CPU。该参数会同时控制 `offload_param` 和 `offload_optimizer`。
 
 有效全局 batch size 的计算公式是：
 
@@ -504,7 +511,7 @@ rate；验证不会阻塞训练。
 Docker 的 `--gpus all` 只负责把宿主机 GPU 暴露给容器，真正参与训练的卡由
 镜像后的脚本参数 `--gpus` 决定。
 
-以下训练示例都假定已按第 4.3 节获取 v1.0.1 源码，并通过
+以下训练示例都假定已按第 4.3 节获取 v1.0.2 源码，并通过
 `-v "${CODE_DIR}/train:/app/train:ro"` 覆盖镜像内置训练代码。
 
 ### 6.1 单机多卡
@@ -601,6 +608,7 @@ nohup docker run --rm \
   --learning-rate 5e-5 \
   --min-learning-rate 5e-6 \
   --lr-scheduler-type cosine_with_min_lr \
+  --offload true \
   --use-lora false \
   --freeze-vision-tower true \
   --save-steps 10 \
@@ -629,7 +637,7 @@ echo "验证汇总=${OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl"
 下面以两台服务器、每台 8 张 GPU 为例。两台服务器必须满足：
 
 - 已导入完全相同的 `qwen36-sft:1.0` 镜像；
-- 已 checkout 完全相同的 v1.0.1 Git tag，并挂载相同的 `train/` 代码；
+- 已 checkout 完全相同的 v1.0.2 Git tag，并挂载相同的 `train/` 代码；
 - 模型和数据内容完全相同，可以是每台本地副本，也可以是共享只读目录；
 - node 0 的 `MASTER_ADDR:MASTER_PORT` 能被其他节点访问；
 - 节点之间允许 PyTorch/NCCL 通信，Docker 使用 `--network host`；
@@ -727,6 +735,7 @@ nohup docker run --rm \
   --learning-rate 5e-5 \
   --min-learning-rate 5e-6 \
   --lr-scheduler-type cosine_with_min_lr \
+  --offload true \
   --use-lora false \
   --freeze-vision-tower true \
   --save-steps 10 \
