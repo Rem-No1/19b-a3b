@@ -153,6 +153,49 @@ class AsyncEvalMarkerTests(unittest.TestCase):
 
 
 class AsyncEvalWorkerTests(unittest.TestCase):
+    def test_wait_for_port_free_retries_until_bind_succeeds(self):
+        with (
+            mock.patch.object(
+                worker,
+                "port_is_free",
+                side_effect=[False, False, True],
+            ) as port_is_free,
+            mock.patch.object(worker.time, "sleep") as sleep,
+        ):
+            worker.wait_for_port_free(
+                "127.0.0.1",
+                18080,
+                timeout=5.0,
+                poll_seconds=0.25,
+            )
+
+        self.assertEqual(port_is_free.call_count, 3)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(0.25), mock.call(0.25)],
+        )
+
+    def test_wait_for_port_free_times_out_with_endpoint(self):
+        with (
+            mock.patch.object(worker, "port_is_free", return_value=False),
+            mock.patch.object(
+                worker.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 1.0],
+            ),
+            mock.patch.object(worker.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                TimeoutError,
+                r"127\.0\.0\.1:18080",
+            ):
+                worker.wait_for_port_free(
+                    "127.0.0.1",
+                    18080,
+                    timeout=1.0,
+                    poll_seconds=0.25,
+                )
+
     def test_worker_restores_processor_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

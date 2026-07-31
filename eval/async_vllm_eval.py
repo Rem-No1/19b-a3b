@@ -293,11 +293,28 @@ def restore_task_metadata(args, task):
 
 def port_is_free(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # Match the reusable-listener behavior used by vLLM/Uvicorn. Without
+        # this, recently closed client connections can make a fully stopped
+        # server look as if it still owns the port until TCP cleanup finishes.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
         except OSError:
             return False
     return True
+
+
+def wait_for_port_free(host, port, timeout, poll_seconds=0.5):
+    deadline = time.monotonic() + timeout
+    while True:
+        if port_is_free(host, port):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"等待 vLLM 端口释放超时 ({timeout:g}s): {host}:{port}"
+            )
+        time.sleep(min(poll_seconds, remaining))
 
 
 def tail_text(path, max_bytes=12000):
@@ -613,10 +630,17 @@ def evaluate_task(args, task, examples):
         return metrics
     finally:
         if process is not None:
-            stop_process_group(process, args.server_stop_timeout)
-            log_handle = getattr(process, "_async_eval_log_handle", None)
-            if log_handle is not None:
-                log_handle.close()
+            try:
+                stop_process_group(process, args.server_stop_timeout)
+                wait_for_port_free(
+                    args.host,
+                    args.port,
+                    timeout=args.server_stop_timeout,
+                )
+            finally:
+                log_handle = getattr(process, "_async_eval_log_handle", None)
+                if log_handle is not None:
+                    log_handle.close()
 
 
 def record_task_failure(task, error, max_attempts):
