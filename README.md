@@ -340,21 +340,25 @@ docker run --rm \
 
 #### 选择 ZeRO-2 或 ZeRO-3
 
-启动器默认使用 ZeRO-3。只需改变一个启动参数即可选择内置配置：
+ZeRO 阶段和 CPU offload 是两个独立选项。启动器默认使用 ZeRO-3，完整组合如下：
+
+| 目标配置 | `ZERO_STAGE` / `--zero-stage` | `--offload` | GPU 中保留的主要模型状态 |
+| --- | --- | --- | --- |
+| ZeRO-3 + CPU offload（默认） | `3` | `true` | 参数、梯度和 optimizer state 均分片；参数及 optimizer state 可卸载到 CPU |
+| ZeRO-3，不 offload | `3` | `false` | 参数、梯度和 optimizer state 均分片并保留在 GPU |
+| ZeRO-2 + optimizer offload | `2` | `true` | 参数在每张 GPU 完整保留；梯度和 optimizer state 分片，optimizer state/计算卸载到 CPU |
+| ZeRO-2，完全不 offload | `2` | `false` | 参数在每张 GPU 完整保留；梯度和 optimizer state 分片并保留在 GPU |
+
+例如，选择 ZeRO-2 且完全关闭 CPU offload：
 
 ```bash
-# 默认：ZeRO-3 + 参数/optimizer state CPU offload
---zero-stage 3 --offload true
-
-# ZeRO-3，不使用 CPU offload
---zero-stage 3 --offload false
-
-# ZeRO-2，只把 optimizer state offload 到 CPU
---zero-stage 2 --offload true
-
-# ZeRO-2，完全不使用 CPU offload
---zero-stage 2 --offload false
+ZERO_STAGE=2
+OFFLOAD=false
 ```
+
+第 6 节的完整命令已经把这两个值放在命令开头，并分别传给
+`-e ZERO_STAGE="${ZERO_STAGE}"` 和 `--offload "${OFFLOAD}"`。只需修改这两行，
+不需要修改 Python、Shell 或 DeepSpeed JSON 文件。
 
 也可以在 `docker run` 的镜像名称之前设置 `-e ZERO_STAGE=2` 或
 `-e ZERO_STAGE=3`。若设置了 `DEEPSPEED_CONFIG`，自定义配置文件优先于
@@ -546,9 +550,29 @@ checkpoint 后启动 vLLM、并发生成 HARP 答案、计算 pass rate、保存
 
 ## 6. 训练脚本启动代码
 
+### 6.0 先选择 ZeRO 阶段和 offload
+
+单机和多机命令开头都有下面两个变量：
+
+```bash
+# 默认配置：ZeRO-3 + CPU offload
+ZERO_STAGE=3
+OFFLOAD=true
+```
+
+按目标硬件把这两行改成以下任意一组：
+
+- ZeRO-3，不使用 CPU offload：`ZERO_STAGE=3`、`OFFLOAD=false`；
+- ZeRO-2，只将 optimizer state/计算卸载到 CPU：`ZERO_STAGE=2`、`OFFLOAD=true`；
+- ZeRO-2，完全关闭 CPU offload：`ZERO_STAGE=2`、`OFFLOAD=false`。
+
+每次只保留其中一组有效赋值。ZeRO-2 的每张 GPU 都保存完整模型参数，正式训练前
+应保留目标上下文长度并临时增加 `--max-steps 2` 做显存冒烟测试。多机训练时，
+所有节点的 `ZERO_STAGE` 和 `OFFLOAD` 必须完全相同。
+
 单机和多机示例均使用六个完整训练文件和 32k 上下文，均为每卡 batch size 1、
-梯度累积 8、
-全参数训练、每 10 个 global steps 保存 checkpoint、最多保留 10 个 checkpoint，
+梯度累积 8、全参数训练、每 10 个 global steps 保存 checkpoint、最多保留
+10 个 checkpoint，
 并训练 1 个 epoch。每个 checkpoint 会使用
 `/datasets/val/HARP/HARP_difficulty_2_sample_50.jsonl` 异步计算一次 pass
 rate；验证不会阻塞训练。
@@ -577,6 +601,10 @@ DATA_DIR="${DELIVERY_ROOT}/data/math100w"
 OUTPUT_ROOT="${DELIVERY_ROOT}/output"
 LOG_DIR="${DELIVERY_ROOT}/logs"
 CACHE_DIR="${DELIVERY_ROOT}/cache"
+
+# 训练配置：当前为默认 ZeRO-3 + offload；ZeRO-2 无 offload 改为 2/false。
+ZERO_STAGE=3
+OFFLOAD=true
 
 mkdir -p \
   "${OUTPUT_ROOT}" \
@@ -634,7 +662,7 @@ nohup docker run --rm \
   -e MODEL_PATH=/model \
   -e OUTPUT_ROOT=/output \
   -e RUN_NAME="${RUN_NAME}" \
-  -e ZERO_STAGE=3 \
+  -e ZERO_STAGE="${ZERO_STAGE}" \
   qwen36-sft:1.0 \
   --gpus 1,2,3,4,6 \
   --data-files \
@@ -657,7 +685,7 @@ nohup docker run --rm \
   --learning-rate 5e-5 \
   --min-learning-rate 5e-6 \
   --lr-scheduler-type cosine_with_min_lr \
-  --offload true \
+  --offload "${OFFLOAD}" \
   --use-lora false \
   --freeze-vision-tower true \
   --save-steps 10 \
@@ -725,10 +753,16 @@ DATA_DIR="${DELIVERY_ROOT}/data/math100w"
 LOCAL_LOG_DIR="${DELIVERY_ROOT}/logs"
 LOCAL_CACHE_DIR="${DELIVERY_ROOT}/cache"
 
+# 训练配置：当前为默认 ZeRO-3 + offload；ZeRO-2 无 offload 改为 2/false。
+# 所有节点必须使用相同的值。
+ZERO_STAGE=3
+OFFLOAD=true
+
 # 必须是已在所有节点挂载好的同一个共享文件系统目录。
 SHARED_OUTPUT_ROOT=/shared/qwen36-output
 
-# 以下五项除 NODE_RANK 外，所有节点必须完全相同。
+# 以下五项除 NODE_RANK 外，所有节点必须完全相同；上面的 ZERO_STAGE 和
+# OFFLOAD 也必须在所有节点保持一致。
 NNODES=2
 NODE_RANK=0
 MASTER_ADDR=10.20.30.40
@@ -757,7 +791,7 @@ nohup docker run --rm \
   -e MODEL_PATH=/model \
   -e OUTPUT_ROOT=/output \
   -e RUN_NAME="${RUN_NAME}" \
-  -e ZERO_STAGE=3 \
+  -e ZERO_STAGE="${ZERO_STAGE}" \
   -e NNODES="${NNODES}" \
   -e NODE_RANK="${NODE_RANK}" \
   -e MASTER_ADDR="${MASTER_ADDR}" \
@@ -785,7 +819,7 @@ nohup docker run --rm \
   --learning-rate 5e-5 \
   --min-learning-rate 5e-6 \
   --lr-scheduler-type cosine_with_min_lr \
-  --offload true \
+  --offload "${OFFLOAD}" \
   --use-lora false \
   --freeze-vision-tower true \
   --save-steps 10 \
