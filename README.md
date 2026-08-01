@@ -1,8 +1,21 @@
 # Qwen3.6-19B-A3B DeepSpeed SFT 交付说明
 
-本文档面向收到代码目录和 Docker 镜像文件的使用者。按第 3、4、6 节操作，
-即可启动训练并在每个已保存 checkpoint 上异步计算验证集 pass rate，无需在
-宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn 或 vLLM。
+本文档面向通过 GitHub 获取代码、通过 Docker Hub 获取镜像的使用者。按第 3、
+4、6 节操作，即可启动训练并在每个已保存 checkpoint 上异步计算验证集 pass
+rate，无需在宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn
+或 vLLM。
+
+交付地址：
+
+- 代码：<https://github.com/Rem-No1/19b-a3b>
+- 镜像：<https://hub.docker.com/r/iceswallow/qwen36-delivery/tags>
+- 推荐训练标签：`iceswallow/qwen36-delivery:sft-1.1-fla`
+- 异步验证标签：`iceswallow/qwen36-delivery:vllm-eval-1.0`
+
+首次使用的最短路线是：准备宿主机 Docker/NVIDIA 环境 → 按第 3 节准备模型和
+数据 → 按第 4.1、4.2 节获取代码和镜像 → 按第 4.3、4.4 节完成自检 → 复制
+第 6.1 节完整命令并只修改顶部路径、GPU 编号、ZeRO/offload 选项。旧版离线
+tar 和本地构建只作为无法访问 Docker Hub 时的备选流程。
 
 > **v1.1-fla 训练镜像：** 推荐使用 `qwen36-sft:1.1-fla`。该镜像在原有
 > FlashAttention 2 之外加入 Qwen3.5 linear-attention 训练所需的
@@ -219,55 +232,13 @@ math100w/
 如果仓库中的目录发生变化，只需同步修改启动命令中
 `/datasets/...` 后面的相对路径。
 
-## 4. 使用交付的 Docker 镜像文件
+## 4. 获取代码和 Docker 镜像
 
-交付的文件名为：
+推荐直接从 GitHub 获取当前代码，并从 Docker Hub 拉取已经验证的两个镜像。
+以下流程不会把模型或数据复制到镜像中；模型、数据、输出、日志和缓存仍位于
+宿主机，通过只读或读写 volume mount 提供给容器。
 
-```text
-qwen36-sft-with-vllm-multinode-1.0.tar
-```
-
-它是 `docker save` 生成的未压缩 Docker 镜像归档，包含：
-
-- `qwen36-sft:1.0`：训练镜像；
-- `qwen36-vllm-eval:1.0`：推荐验证流程使用的独立 vLLM 评测镜像。
-
-### 4.1 校验文件
-
-将终端切换到 tar 所在目录并执行：
-
-```bash
-sha256sum qwen36-sft-with-vllm-multinode-1.0.tar
-```
-
-正确的 SHA-256 为：
-
-```text
-64383790cdf82f5b64f92ac21a73ae3a7b9e277980158df105995194cf8ee51f
-```
-
-若校验值不同，说明文件在传输过程中损坏，不要继续导入。
-
-### 4.2 导入镜像
-
-```bash
-docker load -i qwen36-sft-with-vllm-multinode-1.0.tar
-```
-
-不要使用普通 `tar -xf` 解压该文件。导入后确认两个镜像存在：
-
-```bash
-docker image inspect qwen36-sft:1.0 >/dev/null
-docker image inspect qwen36-vllm-eval:1.0 >/dev/null
-docker images | grep -E 'qwen36-(sft|vllm-eval)'
-```
-
-这一归档中的 `qwen36-sft:1.0` 是旧训练镜像，只具备 full-attention 的
-FlashAttention 2，不具备 Qwen3.5 linear-attention 的完整训练快速路径。
-继续使用该归档中的 vLLM 镜像没有问题；训练建议按第 4.4 节构建
-`qwen36-sft:1.1-fla`。
-
-### 4.3 获取当前训练代码
+### 4.1 获取当前训练代码
 
 首次获取源码：
 
@@ -285,9 +256,60 @@ git switch main
 git pull --ff-only origin main
 ```
 
-旧 `qwen36-sft:1.0` 不包含当前代码；新 `qwen36-sft:1.1-fla` 已嵌入构建时
-代码。以下命令仍只读挂载仓库中的 `train/` 和 `eval/`，确保运行代码与当前
-checkout 完全一致：
+`git pull --ff-only` 要求本地没有与远端冲突的提交或未处理的 rebase。交付环境
+建议使用全新 clone，或者固定在交付方指定的 Git commit/tag。多机训练时所有
+节点必须 checkout 同一个 commit/tag。
+
+记下仓库的绝对路径，后续把它填入 `CODE_DIR`：
+
+```bash
+CODE_DIR="$(pwd)"
+test -f "${CODE_DIR}/train/run_qwen36_19b_a3b_sft_deepspeed.sh"
+test -f "${CODE_DIR}/eval/run_async_vllm_eval.sh"
+git rev-parse HEAD
+```
+
+### 4.2 从 Docker Hub 拉取镜像（推荐）
+
+镜像仓库是公开仓库，一般不需要 `docker login`。使用版本化标签，不要在正式
+交付任务中依赖可能变化的 `sft-latest`：
+
+```bash
+docker pull iceswallow/qwen36-delivery:sft-1.1-fla
+docker pull iceswallow/qwen36-delivery:vllm-eval-1.0
+
+docker tag \
+  iceswallow/qwen36-delivery:sft-1.1-fla \
+  qwen36-sft:1.1-fla
+
+docker tag \
+  iceswallow/qwen36-delivery:vllm-eval-1.0 \
+  qwen36-vllm-eval:1.0
+```
+
+后续命令统一使用较短的本地标签 `qwen36-sft:1.1-fla` 和
+`qwen36-vllm-eval:1.0`。确认两个标签均存在：
+
+```bash
+docker image inspect qwen36-sft:1.1-fla >/dev/null
+docker image inspect qwen36-vllm-eval:1.0 >/dev/null
+docker images | grep -E 'qwen36-(sft|vllm-eval)'
+```
+
+如果拉取出现 `no matching manifest for linux/arm64`，说明宿主机不是交付镜像
+验证过的 Linux x86_64/amd64 平台；不要用 `--platform` 强行开始正式训练。
+
+### 4.3 检查 GPU、入口和代码挂载
+
+先确认 NVIDIA Container Toolkit 能把 GPU 暴露给训练容器：
+
+```bash
+docker run --rm --gpus all \
+  --entrypoint nvidia-smi \
+  qwen36-sft:1.1-fla
+```
+
+再确认当前 checkout 的训练和验证代码能够被容器读取：
 
 ```bash
 CODE_DIR=/absolute/path/to/19b-a3b
@@ -298,52 +320,23 @@ docker run --rm \
 
 docker run --rm \
   -v "${CODE_DIR}/eval:/app/eval:ro" \
-  --entrypoint python \
   qwen36-vllm-eval:1.0 \
-  -m py_compile /app/eval/async_vllm_eval.py
+  --help
 ```
 
-无需重新下载镜像；volume mount 会在运行时覆盖镜像内置的旧 `train/` 和 `eval/`
-目录。
-模型、数据、输出和 cache 的挂载方式不变。多机训练时所有节点必须 checkout
-同一个 Git tag，并挂载完全相同的代码。
+训练镜像已嵌入构建时的代码，但正式命令仍只读挂载当前仓库的 `train/` 和
+`eval/`，使容器实际运行的代码与当前 checkout 完全一致。代码更新后无需重新
+下载镜像；volume mount 会覆盖镜像内置目录。不要把整个项目挂到 `/app`，否则
+可能遮蔽镜像内其他运行环境文件。
 
-使用交付镜像运行热修复回归测试：
+### 4.4 验证 FLA/FlashAttention 训练快速路径
 
-```bash
-CODE_DIR=/absolute/path/to/19b-a3b
-
-docker run --rm \
-  -v "${CODE_DIR}:/workspace:ro" \
-  --entrypoint python \
-  qwen36-sft:1.1-fla \
-  -m unittest discover \
-  -s /workspace/tests \
-  -p test_training_preprocessing.py \
-  -v
-```
-
-预期最后输出 `Ran 13 tests` 和 `OK`（缺少可选依赖时个别测试可能显示 skipped）。
-
-### 4.4 构建并验证 v1.1-fla 训练镜像
-
-在仓库根目录执行：
+开始正式训练前，必须在真实 GPU 上运行一次训练级自检。这里的 `MODEL_DIR` 是
+宿主机模型目录，例如第 3 节中的
+`${DELIVERY_ROOT}/model/19b-a3b`，不是 Git 仓库目录：
 
 ```bash
-docker build --progress=plain \
-  -t qwen36-sft:1.1-fla \
-  .
-```
-
-`causal-conv1d` 对当前 CUDA 13/PyTorch 2.11/Python 3.12 组合没有官方预编译
-wheel，首次构建会从源码编译 CUDA forward/backward 内核。官方构建脚本会生成
-多个 GPU 架构，数分钟内没有新日志是正常现象。不要因为这一阶段较慢而中断。
-
-构建完成后，必须在真实 GPU 上运行训练级验证。下面命令会同时测试低层 kernel
-和按 `/model/config.json` 实例化的 Qwen3.5 MoE linear-attention 层：
-
-```bash
-MODEL_DIR=/absolute/path/to/19b-a3b
+MODEL_DIR=/absolute/path/to/model/19b-a3b
 CACHE_DIR=/absolute/path/to/cache
 
 mkdir -p "${CACHE_DIR}"
@@ -367,9 +360,72 @@ docker run --rm \
 'forward_backward': 'ok'
 ```
 
-首次运行某个 shape 时 TileLang 会编译对应内核。训练命令已经把宿主机 cache
-挂载到 `/cache`，镜像将 TileLang 和 Triton 缓存分别写到 `/cache/tilelang`
-和 `/cache/triton`，后续容器可复用。
+若出现 `forward_backward: ok`，说明 linear-attention 的 FLA/TileLang 路径、
+causal-conv1d 以及 BF16 forward/backward 均可用。仅仅能导入 `flash_attn` 不等于
+Qwen3.5 linear-attention 快速路径可用。首次运行某个 shape 时 TileLang 会编译
+内核；训练命令把宿主机 cache 挂到 `/cache`，后续容器可以复用。
+
+### 4.5 可选：运行代码回归测试
+
+使用交付镜像运行热修复回归测试：
+
+```bash
+CODE_DIR=/absolute/path/to/19b-a3b
+
+docker run --rm \
+  -v "${CODE_DIR}:/workspace:ro" \
+  --entrypoint python \
+  qwen36-sft:1.1-fla \
+  -m unittest discover \
+  -s /workspace/tests \
+  -p test_training_preprocessing.py \
+  -v
+```
+
+预期最后输出 `Ran 13 tests` 和 `OK`（缺少可选依赖时个别测试可能显示 skipped）。
+
+### 4.6 离线 tar 备选流程
+
+只有无法访问 Docker Hub，并且交付方另行提供
+`qwen36-sft-with-vllm-multinode-1.0.tar` 时，才使用本节。先校验：
+
+```bash
+sha256sum qwen36-sft-with-vllm-multinode-1.0.tar
+```
+
+该旧归档的正确 SHA-256 为：
+
+```text
+64383790cdf82f5b64f92ac21a73ae3a7b9e277980158df105995194cf8ee51f
+```
+
+一致后导入；不要用普通 `tar -xf` 解压：
+
+```bash
+docker load -i qwen36-sft-with-vllm-multinode-1.0.tar
+```
+
+该归档里的 `qwen36-vllm-eval:1.0` 可以继续用于异步验证，但
+`qwen36-sft:1.0` 是旧训练镜像，不包含 Qwen3.5 linear-attention 所需的完整
+FLA 快速路径，不能代替推荐的 `qwen36-sft:1.1-fla`。离线环境要训练当前版本，
+应由交付方同时提供新镜像归档，或按第 4.7 节在本机重建。
+
+### 4.7 本地重建训练镜像（可选）
+
+正常交付直接使用第 4.2 节的预构建镜像，无需执行本节。只有需要审计构建过程、
+修改依赖或无法获得新镜像归档时，才在仓库根目录执行：
+
+```bash
+docker build --progress=plain \
+  -t qwen36-sft:1.1-fla \
+  .
+```
+
+`causal-conv1d` 对当前 CUDA 13/PyTorch 2.11/Python 3.12 组合没有官方预编译
+wheel，首次构建会从源码编译 CUDA forward/backward 内核。官方构建脚本会生成
+多个 GPU 架构，数分钟内没有新日志是正常现象。不要因为这一阶段较慢而中断。
+
+构建完成后，必须重新执行第 4.3 和 4.4 节的 GPU/快速路径自检，再开始训练。
 
 ## 5. 训练脚本完整参数及其含义
 
@@ -644,7 +700,7 @@ rate；验证不会阻塞训练。
 Docker 的 `--gpus all` 只负责把宿主机 GPU 暴露给容器，真正参与训练的卡由
 镜像后的脚本参数 `--gpus` 决定。
 
-以下训练示例都假定已按第 4.3 节获取当前源码。训练容器通过
+以下训练示例都假定已按第 4.1、4.2 节获取当前源码和镜像。训练容器通过
 `-v "${CODE_DIR}/train:/app/train:ro"` 覆盖镜像内置训练代码，验证容器通过
 `-v "${CODE_DIR}/eval:/app/eval:ro"` 覆盖镜像内置验证代码。
 
@@ -691,6 +747,7 @@ nohup docker run --rm \
   --ipc=host \
   --shm-size=64g \
   --ulimit memlock=-1 \
+  -e PYTHONUNBUFFERED=1 \
   -v "${CODE_DIR}/eval:/app/eval:ro" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${DATA_DIR}:/datasets:ro" \
@@ -727,6 +784,7 @@ nohup docker run --rm \
   -e OUTPUT_ROOT=/output \
   -e RUN_NAME="${RUN_NAME}" \
   -e ZERO_STAGE="${ZERO_STAGE}" \
+  -e PYTHONUNBUFFERED=1 \
   qwen36-sft:1.1-fla \
   --gpus 1,2,3,4,6 \
   --data-files \
@@ -860,6 +918,7 @@ nohup docker run --rm \
   -e NODE_RANK="${NODE_RANK}" \
   -e MASTER_ADDR="${MASTER_ADDR}" \
   -e MASTER_PORT="${MASTER_PORT}" \
+  -e PYTHONUNBUFFERED=1 \
   -e NCCL_DEBUG=INFO \
   qwen36-sft:1.1-fla \
   --gpus 0,1,2,3,4,5,6,7 \
@@ -933,6 +992,7 @@ nohup docker run --rm \
   --ipc=host \
   --shm-size=64g \
   --ulimit memlock=-1 \
+  -e PYTHONUNBUFFERED=1 \
   -v "${CODE_DIR}/eval:/app/eval:ro" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${DATA_DIR}:/datasets:ro" \
@@ -1028,6 +1088,12 @@ ${OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl
 `results.jsonl` 是所有 checkpoint 的 pass rate 汇总。验证日志中的进度条格式为
 `vLLM验证(step=N): 50/50`。训练完成且所有 ready checkpoint 处理完后，worker
 默认自动退出。
+
+后台日志不是交互式终端，tqdm 使用回车符刷新同一行，因此 `tail -f` 中的进度条
+可能不连续换行，甚至在一段时间后集中显示；这不表示训练卡住。上述命令已设置
+`PYTHONUNBUFFERED=1` 以便普通日志及时落盘。判断训练是否前进时，同时观察日志中
+的 `loss`/`learning_rate`/`epoch`、checkpoint 目录更新时间和 `nvidia-smi`。
+训练结束后，Trainer 汇总中的 `train_runtime` 是完整训练耗时。
 
 多机任务中任一节点失败，整个分布式任务通常都会失败。停止训练时，应在每台
 服务器上执行：
