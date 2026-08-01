@@ -2,6 +2,7 @@
 !Dockerfile
 !README.md
 !requirements.lock
+!requirements-fla.lock
 !train/
 !train/**
 !eval/
