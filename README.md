@@ -4,12 +4,13 @@
 即可启动训练并在每个已保存 checkpoint 上异步计算验证集 pass rate，无需在
 宿主机单独安装 PyTorch、Transformers、DeepSpeed、flash-attn 或 vLLM。
 
-> **v1.0.2 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
+> **v1.0.3 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
 > 非主 rank 长时间等待预处理可能触发 DDP/NCCL timeout 的问题；全参训练默认
 > 学习率改为从 `5e-5` 余弦衰减到 `5e-6`，并支持通过 `--zero-stage 2|3`
-> 选择 ZeRO 阶段、通过 `--offload` 选择是否使用 CPU offload。当前源码继续使用原
-> `qwen36-sft:1.0` 镜像，但训练容器必须按第 4.3 节只读挂载新版 `train/`
-> 目录；不挂载时仍会执行镜像内置的 v1.0.0 代码。
+> 选择 ZeRO 阶段、通过 `--offload` 选择是否使用 CPU offload，并修复连续验证
+> checkpoint 时 vLLM 端口尚未释放的问题。当前源码继续使用原训练和验证镜像，
+> 但必须按第 4.3 节分别只读挂载新版 `train/` 和 `eval/` 目录；不挂载时仍会
+> 执行镜像内置的 v1.0.0 代码。
 
 > 安全提示：下文的 `hf-xxxxxxx` 是交付方提供的 Hugging Face 访问令牌。
 > 不要把真实令牌写入代码、README、Shell 历史或 Git 仓库。若令牌已经公开，
@@ -192,14 +193,13 @@ find "${DELIVERY_ROOT}/data/math100w" -type f \
 
 ```text
 math100w/
-└── split/
-    ├── Nemotron-SFT-Math-v4/train25w.jsonl
-    ├── OpenMathReasoning/train20w.jsonl
-    ├── OpenR1-Math-220k/train.jsonl
-    ├── OpenCodeReasoning-2/train20w.jsonl
-    ├── general/qwen3_235b_thinking_2507_110k_sft.jsonl
-    ├── Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl
-    └── val/HARP/HARP_difficulty_2_sample_50.jsonl
+├── Nemotron-SFT-Math-v4/train25w.jsonl
+├── OpenMathReasoning/train20w.jsonl
+├── OpenR1-Math-220k/train.jsonl
+├── OpenCodeReasoning-2/train20w.jsonl
+├── general/qwen3_235b_thinking_2507_110k_sft.jsonl
+├── Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl
+└── val/HARP/HARP_difficulty_2_sample_50.jsonl
 ```
 
 如果仓库中的目录发生变化，只需同步修改启动命令中
@@ -251,25 +251,25 @@ docker images | grep -E 'qwen36-(sft|vllm-eval)'
 标准训练只使用 `qwen36-sft:1.0`。模型和数据不需要重新打进镜像，也不需要
 重新执行 `docker build`。
 
-### 4.3 获取 v1.0.2 热修复代码
+### 4.3 获取 v1.0.3 热修复代码
 
 首次获取源码：
 
 ```bash
 git clone https://github.com/Rem-No1/19b-a3b.git
 cd 19b-a3b
-git checkout v1.0.2
+git checkout v1.0.3
 ```
 
 已有仓库时：
 
 ```bash
 git fetch origin --tags
-git checkout v1.0.2
+git checkout v1.0.3
 ```
 
-原镜像不包含热修复代码。运行训练容器时必须把仓库中的 `train/` 只读挂载到
-`/app/train`：
+原镜像不包含热修复代码。训练容器必须把仓库中的 `train/` 只读挂载到
+`/app/train`；验证容器必须把仓库中的 `eval/` 只读挂载到 `/app/eval`：
 
 ```bash
 CODE_DIR=/absolute/path/to/19b-a3b
@@ -277,9 +277,16 @@ CODE_DIR=/absolute/path/to/19b-a3b
 docker run --rm \
   -v "${CODE_DIR}/train:/app/train:ro" \
   qwen36-sft:1.0 --help
+
+docker run --rm \
+  -v "${CODE_DIR}/eval:/app/eval:ro" \
+  --entrypoint python \
+  qwen36-vllm-eval:1.0 \
+  -m py_compile /app/eval/async_vllm_eval.py
 ```
 
-无需重新下载镜像；volume mount 会在运行时覆盖镜像内置的旧 `train/` 目录。
+无需重新下载镜像；volume mount 会在运行时覆盖镜像内置的旧 `train/` 和 `eval/`
+目录。
 模型、数据、输出和 cache 的挂载方式不变。多机训练时所有节点必须 checkout
 同一个 Git tag，并挂载完全相同的代码。
 
@@ -302,7 +309,7 @@ docker run --rm \
 
 ## 5. 训练脚本完整参数及其含义
 
-查看 v1.0.2 训练代码的实时帮助：
+查看 v1.0.3 训练代码的实时帮助：
 
 ```bash
 CODE_DIR=/absolute/path/to/19b-a3b
@@ -382,7 +389,7 @@ ZeRO-2 不分片模型参数，通常只适合单卡显存充足或 GPU 数量�
 若数据行自身包含 `enable_thinking` 或 `last_assistant_only`，行级设置的优先级
 高于逐文件参数；逐文件参数又高于全局参数。
 
-v1.0.2 在生成 sampling manifest 时只批量读取
+v1.0.3 在生成 sampling manifest 时只批量读取
 `source_file_index`、`last_assistant_only`、`n_tokens` 和 `has_loss`
 四个元数据字段，不再为统计操作反序列化大体积的 `input_ids` 和 `labels`。
 这不会删除或修改训练 Dataset 中的 token 和 label；Trainer 仍使用完整数据。
@@ -458,7 +465,10 @@ steps 保存并验证一次；如果必须每 5 步验证，需要同时改成 `
 
 全参数 DeepSpeed checkpoint 同时包含模型和优化器状态，单个 checkpoint 可能占用
 约 250 GB。`--save-total-limit 10` 的最坏磁盘需求可能接近 2.5 TB，启动前必须
-检查输出盘空间。
+检查输出盘空间。异步验证速度可能低于 checkpoint 保存速度；如果待验证队列中的
+旧 checkpoint 超出 `--save-total-limit`，Trainer 可能在 worker 开始验证前将其
+删除。正式训练时应按磁盘容量和最大验证积压量提高该参数，确保所有 ready
+checkpoint 在验证完成前一直保留。
 
 ### 5.5 LoRA 参数
 
@@ -536,8 +546,8 @@ checkpoint 后启动 vLLM、并发生成 HARP 答案、计算 pass rate、保存
 
 ## 6. 训练脚本启动代码
 
-单机示例使用六个完整训练文件和 32k 上下文；多机首次联调示例从六个文件合计
-抽取 10,000 条并使用 24k 上下文。两者均为每卡 batch size 1、梯度累积 8、
+单机和多机示例均使用六个完整训练文件和 32k 上下文，均为每卡 batch size 1、
+梯度累积 8、
 全参数训练、每 10 个 global steps 保存 checkpoint、最多保留 10 个 checkpoint，
 并训练 1 个 epoch。每个 checkpoint 会使用
 `/datasets/val/HARP/HARP_difficulty_2_sample_50.jsonl` 异步计算一次 pass
@@ -546,8 +556,9 @@ rate；验证不会阻塞训练。
 Docker 的 `--gpus all` 只负责把宿主机 GPU 暴露给容器，真正参与训练的卡由
 镜像后的脚本参数 `--gpus` 决定。
 
-以下训练示例都假定已按第 4.3 节获取 v1.0.2 源码，并通过
-`-v "${CODE_DIR}/train:/app/train:ro"` 覆盖镜像内置训练代码。
+以下训练示例都假定已按第 4.3 节获取 v1.0.3 源码。训练容器通过
+`-v "${CODE_DIR}/train:/app/train:ro"` 覆盖镜像内置训练代码，验证容器通过
+`-v "${CODE_DIR}/eval:/app/eval:ro"` 覆盖镜像内置验证代码。
 
 ### 6.1 单机多卡
 
@@ -574,6 +585,7 @@ mkdir -p \
   "${CACHE_DIR}/vllm"
 
 test -f "${CODE_DIR}/train/train_qwen36_19b_a3b_sft_deepspeed.py"
+test -f "${CODE_DIR}/eval/async_vllm_eval.py"
 
 RUN_NAME="qwen36-19b-a3b-sft-$(date +%Y%m%d_%H%M%S)"
 TRAIN_CONTAINER="${RUN_NAME}-train"
@@ -587,6 +599,7 @@ nohup docker run --rm \
   --ipc=host \
   --shm-size=64g \
   --ulimit memlock=-1 \
+  -v "${CODE_DIR}/eval:/app/eval:ro" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${DATA_DIR}:/datasets:ro" \
   -v "${OUTPUT_ROOT}:/output" \
@@ -625,12 +638,12 @@ nohup docker run --rm \
   qwen36-sft:1.0 \
   --gpus 1,2,3,4,6 \
   --data-files \
-    /datasets/split/Nemotron-SFT-Math-v4/train25w.jsonl \
-    /datasets/split/OpenMathReasoning/train20w.jsonl \
-    /datasets/split/OpenR1-Math-220k/train.jsonl \
-    /datasets/split/OpenCodeReasoning-2/train20w.jsonl \
-    /datasets/split/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
-    /datasets/split/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
+    /datasets/Nemotron-SFT-Math-v4/train25w.jsonl \
+    /datasets/OpenMathReasoning/train20w.jsonl \
+    /datasets/OpenR1-Math-220k/train.jsonl \
+    /datasets/OpenCodeReasoning-2/train20w.jsonl \
+    /datasets/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
+    /datasets/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
   --max-samples-per-file \
     -1 -1 -1 -1 -1 -1 \
   --last-assistant-only-per-file \
@@ -673,7 +686,7 @@ echo "验证汇总=${OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl"
 下面以两台服务器、每台 8 张 GPU 为例。两台服务器必须满足：
 
 - 已导入完全相同的 `qwen36-sft:1.0` 镜像；
-- 已 checkout 完全相同的 v1.0.2 Git tag，并挂载相同的 `train/` 代码；
+- 已 checkout 完全相同的 v1.0.3 Git tag，并挂载相同的 `train/` 代码；
 - 模型和数据内容完全相同，可以是每台本地副本，也可以是共享只读目录；
 - node 0 的 `MASTER_ADDR:MASTER_PORT` 能被其他节点访问；
 - 节点之间允许 PyTorch/NCCL 通信，Docker 使用 `--network host`；
@@ -753,12 +766,12 @@ nohup docker run --rm \
   qwen36-sft:1.0 \
   --gpus 0,1,2,3,4,5,6,7 \
   --data-files \
-    /datasets/split/Nemotron-SFT-Math-v4/train25w.jsonl \
-    /datasets/split/OpenMathReasoning/train20w.jsonl \
-    /datasets/split/OpenR1-Math-220k/train.jsonl \
-    /datasets/split/OpenCodeReasoning-2/train20w.jsonl \
-    /datasets/split/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
-    /datasets/split/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
+    /datasets/Nemotron-SFT-Math-v4/train25w.jsonl \
+    /datasets/OpenMathReasoning/train20w.jsonl \
+    /datasets/OpenR1-Math-220k/train.jsonl \
+    /datasets/OpenCodeReasoning-2/train20w.jsonl \
+    /datasets/general/qwen3_235b_thinking_2507_110k_sft.jsonl \
+    /datasets/Nemotron-SFT-Instruction-Following-Chat-v3-chat/train6w.jsonl \
   --max-samples-per-file \
     -1 -1 -1 -1 -1 -1 \
   --last-assistant-only-per-file \
@@ -799,6 +812,7 @@ worker。下面示例假设该服务器上的 GPU `0,1` 专用于验证；它可
 
 ```bash
 DELIVERY_ROOT=/data/qwen36-delivery
+CODE_DIR=/absolute/path/to/19b-a3b
 MODEL_DIR="${DELIVERY_ROOT}/model/19b-a3b"
 DATA_DIR="${DELIVERY_ROOT}/data/math100w"
 EVAL_LOG_DIR="${DELIVERY_ROOT}/logs"
@@ -813,6 +827,7 @@ EVAL_LOG_FILE="${EVAL_LOG_DIR}/${RUN_NAME}.async-eval.log"
 
 mkdir -p "${EVAL_LOG_DIR}" "${EVAL_CACHE_DIR}"
 test -d "${SHARED_OUTPUT_ROOT}/${RUN_NAME}"
+test -f "${CODE_DIR}/eval/async_vllm_eval.py"
 
 nohup docker run --rm \
   --name "${EVAL_CONTAINER}" \
@@ -820,6 +835,7 @@ nohup docker run --rm \
   --ipc=host \
   --shm-size=64g \
   --ulimit memlock=-1 \
+  -v "${CODE_DIR}/eval:/app/eval:ro" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${DATA_DIR}:/datasets:ro" \
   -v "${SHARED_OUTPUT_ROOT}:/output" \
@@ -902,11 +918,14 @@ tail -n 20 "${SHARED_OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl"
 每个 checkpoint 的文件位于：
 
 ```text
-${OUTPUT_ROOT}/${RUN_NAME}/async_eval/checkpoint-N/metrics.json
-${OUTPUT_ROOT}/${RUN_NAME}/async_eval/checkpoint-N/predictions.jsonl
-${OUTPUT_ROOT}/${RUN_NAME}/async_eval/checkpoint-N/vllm_server.log
+${OUTPUT_ROOT}/${RUN_NAME}/async_eval/checkpoint-XXXXXXXX/metrics.json
+${OUTPUT_ROOT}/${RUN_NAME}/async_eval/checkpoint-XXXXXXXX/predictions.jsonl
+${OUTPUT_ROOT}/${RUN_NAME}/async_eval/checkpoint-XXXXXXXX/vllm_server.log
 ${OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl
 ```
+
+其中 `XXXXXXXX` 是八位补零的 global step，例如 step 10 对应
+`checkpoint-00000010`。
 
 `results.jsonl` 是所有 checkpoint 的 pass rate 汇总。验证日志中的进度条格式为
 `vLLM验证(step=N): 50/50`。训练完成且所有 ready checkpoint 处理完后，worker
