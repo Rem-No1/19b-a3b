@@ -10,7 +10,7 @@ LAUNCHER = PACKAGE_ROOT / "train" / "run_qwen36_19b_a3b_sft_deepspeed.sh"
 
 
 class MultiNodeLauncherTests(unittest.TestCase):
-    def run_launcher(self, extra_env=None):
+    def run_launcher(self, extra_env=None, extra_args=None):
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
             fake_python = temporary_path / "python"
@@ -33,6 +33,8 @@ class MultiNodeLauncherTests(unittest.TestCase):
                 "NNODES",
                 "NODE_RANK",
                 "NPROC_PER_NODE",
+                "ZERO_STAGE",
+                "DEEPSPEED_CONFIG",
             ):
                 env.pop(name, None)
             env.update(
@@ -47,15 +49,17 @@ class MultiNodeLauncherTests(unittest.TestCase):
             if extra_env:
                 env.update(extra_env)
 
+            command = [
+                "bash",
+                str(LAUNCHER),
+                "--gpus",
+                "0,1",
+                "--data-files",
+                "/datasets/train.jsonl",
+            ]
+            command.extend(extra_args or [])
             return subprocess.run(
-                [
-                    "bash",
-                    str(LAUNCHER),
-                    "--gpus",
-                    "0,1",
-                    "--data-files",
-                    "/datasets/train.jsonl",
-                ],
+                command,
                 cwd=PACKAGE_ROOT,
                 env=env,
                 text=True,
@@ -84,6 +88,26 @@ class MultiNodeLauncherTests(unittest.TestCase):
         self.assertNotIn("--master_addr", args)
         self.assertIn("WORLD_SIZE=2", result.stdout)
         self.assertIn("MASTER_ADDR=standalone", result.stdout)
+        self.assertIn("ZERO_STAGE=3", result.stdout)
+        self.assertIn("qwen36_19b_a3b_zero3.json", result.stdout)
+
+    def test_zero_stage_two_selects_built_in_config(self):
+        result = self.run_launcher(extra_args=["--zero-stage", "2"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.torchrun_args(result)
+        self.assertEqual(
+            args[args.index("--deepspeed") + 1],
+            str(PACKAGE_ROOT / "train" / "ds_config" / "qwen36_19b_a3b_zero2.json"),
+        )
+        self.assertIn("ZERO_STAGE=2", result.stdout)
+
+    def test_rejects_unsupported_zero_stage(self):
+        result = self.run_launcher({"ZERO_STAGE": "1"})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("只支持 2 或 3", result.stderr)
+        self.assertEqual(self.torchrun_args(result), [])
 
     def test_multi_node_uses_static_rendezvous(self):
         result = self.run_launcher(

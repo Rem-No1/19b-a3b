@@ -1,4 +1,4 @@
-"""DeepSpeed ZeRO-3 SFT for the pruned Qwen3.6/Qwen3.5-35B-A3B checkpoint.
+"""DeepSpeed ZeRO-2/3 SFT for the pruned Qwen3.6/Qwen3.5-35B-A3B checkpoint.
 
 The input checkpoint is a complete ``Qwen3_5MoeForConditionalGeneration``
 model with 128 routed experts (about 19B parameters). This trainer performs
@@ -70,7 +70,7 @@ def parse_bool(value):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Qwen3.6-19B-A3B mixed-thinking tool-chat SFT with DeepSpeed ZeRO-3."
+        description="Qwen3.6-19B-A3B mixed-thinking tool-chat SFT with DeepSpeed ZeRO-2/3."
     )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--data-files", nargs="+", required=True)
@@ -87,8 +87,9 @@ def build_arg_parser():
         type=parse_bool,
         default=True,
         help=(
-            "Whether to offload both ZeRO-3 parameters and optimizer states to CPU. "
-            "Set false only when aggregate GPU memory is sufficient."
+            "Whether to use CPU offload. ZeRO-2 offloads optimizer states; ZeRO-3 "
+            "offloads parameters and optimizer states. Set false only when GPU "
+            "memory is sufficient."
         ),
     )
     parser.add_argument("--expected-num-experts", type=int, default=128)
@@ -733,7 +734,7 @@ def build_dataset(args, tokenizer, split="train"):
     return kept, stats, manifest
 
 
-def build_training_arguments(args):
+def build_training_arguments(args, deepspeed_config=None):
     from transformers import TrainingArguments
 
     lr_scheduler_kwargs = None
@@ -742,7 +743,7 @@ def build_training_arguments(args):
 
     return TrainingArguments(
         output_dir=args.output_dir,
-        deepspeed=build_deepspeed_config(args),
+        deepspeed=deepspeed_config or build_deepspeed_config(args),
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -782,15 +783,24 @@ def build_deepspeed_config(args):
         raise ValueError(
             f"DeepSpeed 配置缺少 zero_optimization 对象: {args.deepspeed}"
         )
+    stage = zero_config.get("stage")
+    if stage not in (2, 3):
+        raise ValueError(
+            f"本训练器只支持 DeepSpeed ZeRO-2/3，配置中的 stage={stage!r}: "
+            f"{args.deepspeed}"
+        )
     if args.offload:
         zero_config["offload_optimizer"] = {
             "device": "cpu",
             "pin_memory": True,
         }
-        zero_config["offload_param"] = {
-            "device": "cpu",
-            "pin_memory": True,
-        }
+        if stage == 3:
+            zero_config["offload_param"] = {
+                "device": "cpu",
+                "pin_memory": True,
+            }
+        else:
+            zero_config.pop("offload_param", None)
     else:
         zero_config.pop("offload_optimizer", None)
         zero_config.pop("offload_param", None)
@@ -863,10 +873,16 @@ def train(args):
 
     args = normalize_args(args)
     runtime_preflight(args)
-    training_args = build_training_arguments(args)
+    deepspeed_config = build_deepspeed_config(args)
+    training_args = build_training_arguments(args, deepspeed_config)
+    zero_config = deepspeed_config["zero_optimization"]
+    zero_stage = zero_config["stage"]
+    offload_target = "optimizer state"
+    if zero_stage == 3:
+        offload_target = "parameter/optimizer state"
     rank0_print(
-        "DeepSpeed ZeRO-3 CPU parameter/optimizer offload="
-        f"{'启用' if args.offload else '关闭'}"
+        f"DeepSpeed ZeRO-{zero_stage} CPU {offload_target} offload="
+        f"{'启用' if args.offload else '关闭'}，config={args.deepspeed}"
     )
     model, tokenizer = build_model_and_tokenizer(args)
     model = apply_lora_if_requested(args, model)

@@ -6,8 +6,8 @@
 
 > **v1.0.2 代码热修复：** 修复百万级数据预处理时 manifest 扫描过慢，以及
 > 非主 rank 长时间等待预处理可能触发 DDP/NCCL timeout 的问题；全参训练默认
-> 学习率改为从 `5e-5` 余弦衰减到 `5e-6`，并支持通过 `--offload`
-> 开关选择是否使用 CPU offload。v1.0.2 源码继续使用原
+> 学习率改为从 `5e-5` 余弦衰减到 `5e-6`，并支持通过 `--zero-stage 2|3`
+> 选择 ZeRO 阶段、通过 `--offload` 选择是否使用 CPU offload。当前源码继续使用原
 > `qwen36-sft:1.0` 镜像，但训练容器必须按第 4.3 节只读挂载新版 `train/`
 > 目录；不挂载时仍会执行镜像内置的 v1.0.0 代码。
 
@@ -19,8 +19,9 @@
 
 本项目用于对 Qwen3.6/Qwen3.5 架构的 19B-A3B、128-expert MoE 模型进行
 单机或多机多卡监督微调（SFT）。训练基于 Hugging Face Transformers 和
-DeepSpeed，默认采用 BF16、FlashAttention 2、梯度检查点以及 ZeRO-3 CPU
-offload。单机是默认模式；多机通过四个环境变量启用，无需修改 Python 训练代码。
+DeepSpeed，支持 ZeRO-2 和 ZeRO-3，默认采用 BF16、FlashAttention 2、梯度检查点
+以及 ZeRO-3 CPU offload。单机是默认模式；多机通过四个环境变量启用，无需修改
+Python 训练代码。
 
 数据支持 JSONL 文件或顶层为数组的 JSON 文件。每条训练记录至少需要包含
 OpenAI/Qwen 风格的 `messages` 字段，也支持 `tools`、逐行
@@ -39,6 +40,7 @@ qwen36_sft/
 │   ├── pass_rate_eval.py
 │   ├── async_eval_markers.py
 │   └── ds_config/
+│       ├── qwen36_19b_a3b_zero2.json
 │       └── qwen36_19b_a3b_zero3.json
 ├── eval/
 │   ├── async_vllm_eval.py
@@ -57,7 +59,8 @@ qwen36_sft/
 | `train/run_qwen36_19b_a3b_sft_deepspeed.sh` | 容器入口和单机/多机多卡启动器；校验节点与 GPU 参数、执行预检并调用 `torchrun`。 |
 | `train/train_qwen36_19b_a3b_sft_deepspeed.py` | 主训练程序；加载模型和数据、构造 assistant-only loss mask、启动 Transformers Trainer。 |
 | `train/toolchat_data.py` | JSON/JSONL 读取、逐文件抽样、chat template 编码和 assistant token mask。 |
-| `train/ds_config/qwen36_19b_a3b_zero3.json` | DeepSpeed ZeRO-3、CPU 参数 offload 和 CPU optimizer offload 配置。 |
+| `train/ds_config/qwen36_19b_a3b_zero2.json` | DeepSpeed ZeRO-2 配置；`--offload` 只控制 optimizer state 是否放到 CPU。 |
+| `train/ds_config/qwen36_19b_a3b_zero3.json` | 默认 DeepSpeed ZeRO-3 配置；`--offload` 控制参数和 optimizer state 是否放到 CPU。 |
 | `train/pass_rate_eval.py` | 训练进程内生成式 pass rate 评测实现，适合短输出调试。 |
 | `train/async_eval_markers.py` | 在 checkpoint 完整保存后生成异步评测 ready 标记。 |
 | `eval/` | 独立 vLLM 评测工具；推荐的 HARP pass rate 验证需要启动一个 worker。 |
@@ -106,9 +109,11 @@ docker run --rm --gpus all \
   qwen36-sft:1.0
 ```
 
-当前配置使用 DeepSpeed ZeRO-3，将参数、梯度和优化器状态分片，并把模型参数
-与优化器卸载到 CPU。使用其他 GPU、较少的 CPU 内存或不同驱动时，需要重新评估
-兼容性、显存、主机内存和训练速度。24k 上下文的资源消耗较高。
+默认配置使用 DeepSpeed ZeRO-3，将参数、梯度和优化器状态分片，并把模型参数
+与优化器卸载到 CPU。也可以选择 ZeRO-2；此时参数在每张 GPU 上完整保留，只有
+梯度和优化器状态分片，因此需要明显更多的单卡显存。使用其他 GPU、较少的 CPU
+内存或不同驱动时，需要重新评估兼容性、显存、主机内存和训练速度。24k/32k
+上下文的资源消耗较高。
 
 多机训练还要求节点之间能够互相通信，并且所有节点能够访问同一个共享输出
 目录。推荐使用 NFS、Lustre、CephFS 等共享文件系统保存 checkpoint。
@@ -293,7 +298,7 @@ docker run --rm \
   -v
 ```
 
-预期最后输出 `Ran 11 tests` 和 `OK`。
+预期最后输出 `Ran 13 tests` 和 `OK`（缺少可选依赖时个别测试可能显示 skipped）。
 
 ## 5. 训练脚本完整参数及其含义
 
@@ -315,15 +320,44 @@ docker run --rm \
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `--gpus` | `CUDA_VISIBLE_DEVICES`，否则 `0` | 宿主机 GPU 编号，逗号分隔。启动器按数量创建相同数量的 `torchrun` 进程。 |
+| `--zero-stage` | `ZERO_STAGE`，否则 `3` | 选择内置的 ZeRO-2 或 ZeRO-3 配置，只接受 `2` 或 `3`。也可使用同名环境变量。 |
 | `--model-path` | `/model` | 模型目录。必须包含 `config.json`、`model.safetensors.index.json`、tokenizer 文件及全部权重分片。 |
 | `--data-files` | 无，必填 | 一个或多个训练 JSON/JSONL 文件。 |
 | `--eval-data-files` | 不启用 | 可选验证文件；提供后按 `--eval-steps` 在训练进程内验证。 |
 | `--output-dir` | `/output/${RUN_NAME}` | checkpoint、Trainer 状态和数据清单输出目录。 |
-| `--deepspeed` | 内置 ZeRO-3 JSON | DeepSpeed 配置文件路径。 |
-| `--offload` | `true` | 是否把 ZeRO-3 参数和 optimizer state 同时 offload 到 CPU；设为 `false` 时两者都保留在 GPU。 |
+| `--deepspeed` | 由 `--zero-stage` 选择 | DeepSpeed 配置文件路径。通常使用 `--zero-stage` 即可；直接运行 Python 时可显式传入。 |
+| `--offload` | `true` | ZeRO-2 下控制 optimizer state CPU offload；ZeRO-3 下同时控制参数和 optimizer state CPU offload。 |
 | `--expected-num-experts` | `128` | 预检时要求模型具有的 routed expert 数量。 |
 | `--resume-from-checkpoint` | 不启用 | 从指定 `checkpoint-N` 恢复模型、优化器、scheduler 和训练进度。 |
 | `--run-name` | 启动器自动生成 | 本次任务名称；同时用于默认输出子目录。 |
+
+#### 选择 ZeRO-2 或 ZeRO-3
+
+启动器默认使用 ZeRO-3。只需改变一个启动参数即可选择内置配置：
+
+```bash
+# 默认：ZeRO-3 + 参数/optimizer state CPU offload
+--zero-stage 3 --offload true
+
+# ZeRO-3，不使用 CPU offload
+--zero-stage 3 --offload false
+
+# ZeRO-2，只把 optimizer state offload 到 CPU
+--zero-stage 2 --offload true
+
+# ZeRO-2，完全不使用 CPU offload
+--zero-stage 2 --offload false
+```
+
+也可以在 `docker run` 的镜像名称之前设置 `-e ZERO_STAGE=2` 或
+`-e ZERO_STAGE=3`。若设置了 `DEEPSPEED_CONFIG`，自定义配置文件优先于
+`ZERO_STAGE/--zero-stage` 选择的内置文件；显式传入 `--deepspeed` 时又以该
+命令行值为准。训练日志会打印最终实际使用的 ZeRO 阶段和配置路径。
+
+ZeRO-2 不分片模型参数，通常只适合单卡显存充足或 GPU 数量很多的环境；ZeRO-3
+显存占用更低。切换阶段后先以目标序列长度运行 `--max-steps 2` 做显存测试。
+不要使用 ZeRO-2 直接恢复 ZeRO-3 的 optimizer checkpoint，反向切换也一样；
+更换阶段时应创建新任务并从 Hugging Face 模型权重启动。
 
 ### 5.2 数据和序列参数
 
@@ -379,10 +413,10 @@ Transformers Trainer，避免 DeepSpeed 的 `WarmupLR` 覆盖
 `cosine_with_min_lr`。如果自行替换 DeepSpeed 配置，也应保持不设置
 `scheduler`，否则上述余弦衰减参数不会生效。
 
-`--offload true` 是默认且更稳妥的配置，显著降低 GPU 显存需求，但 CPU-GPU
-数据交换可能降低训练速度。如果每张 GPU 都有足够显存，可传
-`--offload false`，继续使用 ZeRO-3 分片，但参数与 optimizer state 不再
-放到 CPU。该参数会同时控制 `offload_param` 和 `offload_optimizer`。
+`--offload true` 是默认且更节省显存的配置，但 CPU-GPU 数据交换可能降低训练
+速度。ZeRO-3 会 offload 参数与 optimizer state；ZeRO-2 不支持参数 offload，
+因此只 offload optimizer state。传入 `--offload false` 后，两种阶段都不会使用
+CPU offload。
 
 有效全局 batch size 的计算公式是：
 
@@ -422,7 +456,7 @@ Transformers Trainer，避免 DeepSpeed 的 `WarmupLR` 覆盖
 决定，不使用 `--eval-steps`。例如 `--save-steps 10` 表示每 10 个 global
 steps 保存并验证一次；如果必须每 5 步验证，需要同时改成 `--save-steps 5`。
 
-全参数 ZeRO-3 checkpoint 同时包含模型和优化器分片，单个 checkpoint 可能占用
+全参数 DeepSpeed checkpoint 同时包含模型和优化器状态，单个 checkpoint 可能占用
 约 250 GB。`--save-total-limit 10` 的最坏磁盘需求可能接近 2.5 TB，启动前必须
 检查输出盘空间。
 
@@ -465,7 +499,8 @@ steps 保存并验证一次；如果必须每 5 步验证，需要同时改成 `
 | `RUN_BACKGROUND` | `0` | 设置为 `1` 时由入口脚本自行 `nohup`；Docker 启动示例不需要它。 |
 | `LOG_DIR` | `OUTPUT_ROOT`，未设置时为代码目录下的 `logs` | `RUN_BACKGROUND=1` 时的日志目录。 |
 | `RUN_LOG_FILE` | 自动生成 | `RUN_BACKGROUND=1` 时显式指定日志文件。 |
-| `DEEPSPEED_CONFIG` | 镜像内置 JSON | 替换 DeepSpeed 配置文件。 |
+| `ZERO_STAGE` | `3` | 选择内置 ZeRO 配置，只接受 `2` 或 `3`；等价于 `--zero-stage`。 |
+| `DEEPSPEED_CONFIG` | 不设置 | 使用自定义 DeepSpeed JSON；设置后覆盖 `ZERO_STAGE/--zero-stage` 的内置文件选择。 |
 | `EXPECTED_NUM_EXPERTS` | `128` | 模型 expert 数预期值。 |
 
 ### 5.7 异步 vLLM 验证参数
@@ -586,6 +621,7 @@ nohup docker run --rm \
   -e MODEL_PATH=/model \
   -e OUTPUT_ROOT=/output \
   -e RUN_NAME="${RUN_NAME}" \
+  -e ZERO_STAGE=3 \
   qwen36-sft:1.0 \
   --gpus 1,2,3,4,6 \
   --data-files \
@@ -650,7 +686,7 @@ echo "验证汇总=${OUTPUT_ROOT}/${RUN_NAME}/async_eval/results.jsonl"
 所有训练节点还必须传入 `--async-eval-markers true`。整个多机训练任务只启动
 一个 `qwen36-vllm-eval:1.0` worker；不要在每个训练节点重复启动。
 
-不要让每台服务器分别使用自己的本地输出盘冒充同一个 `/output`。ZeRO-3
+不要让每台服务器分别使用自己的本地输出盘冒充同一个 `/output`。DeepSpeed
 checkpoint 由多个 global rank 共同保存；输出不共享会得到分散或不完整的
 checkpoint。
 
@@ -708,6 +744,7 @@ nohup docker run --rm \
   -e MODEL_PATH=/model \
   -e OUTPUT_ROOT=/output \
   -e RUN_NAME="${RUN_NAME}" \
+  -e ZERO_STAGE=3 \
   -e NNODES="${NNODES}" \
   -e NODE_RANK="${NODE_RANK}" \
   -e MASTER_ADDR="${MASTER_ADDR}" \

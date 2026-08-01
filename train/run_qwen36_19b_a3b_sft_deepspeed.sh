@@ -43,7 +43,8 @@ fi
 cd "${REPO_ROOT}"
 
 MODEL_PATH=${MODEL_PATH:-/model}
-DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-${SCRIPT_DIR}/ds_config/qwen36_19b_a3b_zero3.json}
+ZERO_STAGE=${ZERO_STAGE:-3}
+DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-}
 EXPECTED_NUM_EXPERTS=${EXPECTED_NUM_EXPERTS:-128}
 
 if [[ -n "${CONDA_ENV_PREFIX:-}" ]]; then
@@ -71,6 +72,8 @@ export PATH="${PYTHON_DIR}:${PATH}"
 for argument in "$@"; do
   if [[ "${argument}" == "-h" || "${argument}" == "--help" ]]; then
     echo "Launcher option: --gpus 0,1,... (default: CUDA_VISIBLE_DEVICES or 0)"
+    echo "Launcher option: --zero-stage 2|3 (default: ZERO_STAGE or 3)"
+    echo "  DEEPSPEED_CONFIG overrides the built-in config selected by --zero-stage."
     echo "Multi-node env: NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT"
     echo "  NNODES=1 (default) uses standalone mode."
     echo "  NNODES>1 requires one unique NODE_RANK per node and a shared MASTER_ADDR."
@@ -92,6 +95,15 @@ while [[ $# -gt 0 ]]; do
       GPUS="${1#--gpus=}"
       shift
       ;;
+    --zero-stage)
+      [[ $# -lt 2 ]] && { echo "[error] --zero-stage 需要 2 或 3" >&2; exit 2; }
+      ZERO_STAGE="$2"
+      shift 2
+      ;;
+    --zero-stage=*)
+      ZERO_STAGE="${1#--zero-stage=}"
+      shift
+      ;;
     --data-files|--data-files=*)
       HAS_DATA_FILES=1
       TRAIN_ARGS+=("$1")
@@ -104,6 +116,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 export CUDA_VISIBLE_DEVICES="${GPUS}"
+
+if [[ "${ZERO_STAGE}" != "2" && "${ZERO_STAGE}" != "3" ]]; then
+  echo "[error] ZERO_STAGE/--zero-stage 只支持 2 或 3，当前值: ${ZERO_STAGE}" >&2
+  exit 2
+fi
+if [[ -z "${DEEPSPEED_CONFIG}" ]]; then
+  DEEPSPEED_CONFIG="${SCRIPT_DIR}/ds_config/qwen36_19b_a3b_zero${ZERO_STAGE}.json"
+fi
 
 if [[ -z "${GPUS}" ]]; then
   echo "[error] GPU 列表不能为空" >&2
@@ -248,6 +268,8 @@ echo "MASTER_ADDR=${MASTER_ADDR:-standalone}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "RUN_NAME=${RUN_NAME}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
+echo "ZERO_STAGE=${ZERO_STAGE}"
+echo "DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG}"
 echo "USE_LORA=${USE_LORA}"
 echo "FREEZE_VISION_TOWER=${FREEZE_VISION_TOWER}"
 echo "LAST_ASSISTANT_ONLY=${LAST_ASSISTANT_ONLY}"

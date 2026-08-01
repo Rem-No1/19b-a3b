@@ -276,6 +276,56 @@ class TrainingPreprocessingTests(unittest.TestCase):
             source_config["zero_optimization"],
         )
 
+    def test_zero2_offload_only_moves_optimizer_states_to_cpu(self):
+        config_path = (
+            PACKAGE_ROOT
+            / "train"
+            / "ds_config"
+            / "qwen36_19b_a3b_zero2.json"
+        )
+        args = training.normalize_args(
+            training.build_arg_parser().parse_args(
+                [
+                    "--data-files",
+                    "/data/train.jsonl",
+                    "--deepspeed",
+                    str(config_path),
+                    "--offload",
+                    "true",
+                ]
+            )
+        )
+        zero_config = training.build_deepspeed_config(args)["zero_optimization"]
+
+        self.assertEqual(zero_config["stage"], 2)
+        self.assertEqual(zero_config["offload_optimizer"]["device"], "cpu")
+        self.assertNotIn("offload_param", zero_config)
+
+    def test_zero2_can_run_without_offload(self):
+        config_path = (
+            PACKAGE_ROOT
+            / "train"
+            / "ds_config"
+            / "qwen36_19b_a3b_zero2.json"
+        )
+        args = training.normalize_args(
+            training.build_arg_parser().parse_args(
+                [
+                    "--data-files",
+                    "/data/train.jsonl",
+                    "--deepspeed",
+                    str(config_path),
+                    "--offload",
+                    "false",
+                ]
+            )
+        )
+        zero_config = training.build_deepspeed_config(args)["zero_optimization"]
+
+        self.assertEqual(zero_config["stage"], 2)
+        self.assertNotIn("offload_optimizer", zero_config)
+        self.assertNotIn("offload_param", zero_config)
+
     def test_ddp_timeout_must_be_positive(self):
         args = training.build_arg_parser().parse_args(
             ["--data-files", "/data/train.jsonl", "--ddp-timeout", "0"]
